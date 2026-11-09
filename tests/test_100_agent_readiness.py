@@ -1,4 +1,6 @@
 import json
+import base64
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -9,6 +11,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
 from run_experiment import (
+    _workload_command,
     _preflight_kueue_admission,
     agent_name_prefix,
     build_queue,
@@ -117,6 +120,19 @@ def test_mock_corpus_packing_preserves_sessions_and_bounds_objects():
         len(json.dumps({"sessions": part}, separators=(",", ":")).encode("utf-8")) <= 500
         for part in parts
     )
+
+
+def test_research_command_passes_only_recorded_result_size():
+    command = _workload_command(
+        "r1", "research_deep_search", "browsecompplus", 3, 0,
+        "mcp__environment__get_document", {"docid": "47683"},
+        "http://research-backend:8093", 7005,
+    )
+    encoded = re.search(r"base64\.b64decode\('([^']+)'\)", command[2]).group(1)
+    payload = json.loads(base64.b64decode(encoded))
+    assert payload["recorded_result_bytes"] == 7005
+    assert payload["arguments"] == {"docid": "47683"}
+    assert "recorded_result" not in payload
 
 
 class _FakeCluster:

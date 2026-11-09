@@ -44,3 +44,22 @@ def test_domain_backends_keep_session_state(tmp_path):
     result = support.execute({"session_id": "c1", "benchmark": "tau2_airline", "tool": "book_flight", "arguments": {"route": "A-B"}, "turn": 0, "call": 0})
     assert json.loads(result["result"])["status"] == "created"
     assert support.sessions["c1"]["bookings"]
+
+
+def test_research_results_match_recorded_byte_length(tmp_path):
+    research = DomainBackend("research_deep_search", tmp_path / "research")
+    for tool, arguments, expected_type in (
+        ("mcp__environment__search", {"query": "agent systems"}, list),
+        ("mcp__environment__get_document", {"docid": "47683"}, dict),
+    ):
+        response = research.execute({
+            "session_id": "r1",
+            "benchmark": "browsecompplus",
+            "tool": tool,
+            "arguments": arguments,
+            "recorded_result_bytes": 7005,
+        })
+        result = response["result"]
+        assert len(result.encode("utf-8")) == 7005
+        assert isinstance(json.loads(result), expected_type)
+        assert "Synthetic research text" in result
