@@ -3299,6 +3299,7 @@ def _workload_command(
     name: str,
     arguments: dict[str, Any],
     endpoint: str,
+    recorded_result_bytes: int | None = None,
 ) -> list[str]:
     """Build a sandbox command for a workload-specific internal API.
 
@@ -3307,7 +3308,7 @@ def _workload_command(
     is embedded in the command, so a successful run proves that the selected
     backend, rather than the LLM simulator, produced the tool response.
     """
-    payload = base64.b64encode(json.dumps({
+    request = {
         "session_id": session_id,
         "workload": workload,
         "benchmark": benchmark,
@@ -3315,7 +3316,14 @@ def _workload_command(
         "call": call,
         "tool": name,
         "arguments": arguments,
-    }, separators=(",", ":")).encode()).decode()
+    }
+    if (
+        workload == "research_deep_search"
+        and recorded_result_bytes is not None
+        and (name.endswith("__search") or name.endswith("__get_document"))
+    ):
+        request["recorded_result_bytes"] = recorded_result_bytes
+    payload = base64.b64encode(json.dumps(request, separators=(",", ":")).encode()).decode()
     endpoint_literal = json.dumps(endpoint.rstrip("/"))
     code = (
         "import base64,json,os,sys,urllib.request,urllib.error;"
@@ -3477,6 +3485,8 @@ def prepare_workload_corpus(
                         name,
                         arguments,
                         spec.base_url,
+                        len(tool["recorded_result"].encode("utf-8"))
+                        if isinstance(tool.get("recorded_result"), str) else None,
                     )
                     mapped[workload] += 1
     present_workloads = {
