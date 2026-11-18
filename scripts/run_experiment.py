@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+from bisect import bisect_right
+from collections import Counter, defaultdict
 import fcntl
 import hashlib
 import io
@@ -108,6 +110,7 @@ from trace_replay_sim.collect import collect as collect_prometheus
 from trace_replay_sim.collect import skipped_report as skipped_prometheus_report
 from trace_replay_sim.collect import write_report as write_prometheus_report
 from trace_replay_sim.functional_conformance import verify_trace, write_report
+from trace_replay_sim.audit_corpus import classify_session as audit_replay_session
 from trace_replay_sim.jaeger_export import compute_timing_segments, extract_per_turn, export as export_jaeger
 from trace_replay_sim.per_turn_analysis import analyze as analyze_per_turn
 from trace_replay_sim.profiler_v2 import profile as profile_v2
@@ -814,6 +817,7 @@ def stage_swe_repositories(
     workspace_pvcs: dict[str, str],
     staging_node: str | None = None,
     checkpoint_dir: Path | None = None,
+    scripts_by_agent: dict[int, Path] | None = None,
 ) -> None:
     """Copy real SWE task snapshots into the agent's shared workspace.
 
@@ -837,7 +841,7 @@ def stage_swe_repositories(
         workspace = workspace_names[agent_index]
         node = agent_nodes[agent_index]
         checkpoint = (checkpoint_dir / "swe-staging" / f"{agent_index + 1:03d}.json") if checkpoint_dir else None
-        if checkpoint and _staged_repository_is_valid(
+        if checkpoint and not scripts_by_agent and _staged_repository_is_valid(
             cluster,
             openshell_ns,
             workspace,
@@ -1002,6 +1006,34 @@ def stage_swe_repositories(
                 raise RuntimeError(
                     f"SWE sandbox repository mismatch for agent {agent_index + 1}: expected {commit}, observed {observed or '<empty>'}"
                 )
+            script_dir = (scripts_by_agent or {}).get(agent_index)
+            if script_dir is not None:
+                scripts = sorted(script_dir.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9][0-9].py"))
+                if not scripts:
+                    raise RuntimeError(f"SWE replay scripts missing for agent {agent_index + 1}: {script_dir}")
+                bundle = io.BytesIO()
+                with tarfile.open(fileobj=bundle, mode="w:gz") as archive:
+                    for script in scripts:
+                        archive.add(script, arcname=script.name)
+                install_code = (
+                    "import os,sys,tarfile;root='/tmp/trace-replay-tool-calls';"
+                    "os.makedirs(root,exist_ok=True);"
+                    "archive=tarfile.open(fileobj=sys.stdin.buffer,mode='r|gz');"
+                    "[(open(os.path.join(root,item.name),'wb').write(archive.extractfile(item).read()),"
+                    "os.chmod(os.path.join(root,item.name),0o644)) for item in archive if item.isfile() "
+                    "and item.name.endswith('.py') and '/' not in item.name]"
+                )
+                install = subprocess.run(
+                    ["oc", "-n", openshell_ns, "exec", "-i", sandbox_pod, "-c", sandbox_container,
+                     "--", "python3", "-c", install_code],
+                    input=bundle.getvalue(), capture_output=True, env=cluster.env, timeout=120,
+                    check=False,
+                )
+                if install.returncode != 0:
+                    raise RuntimeError(
+                        f"SWE replay script installation failed for agent {agent_index + 1}: "
+                        + install.stderr.decode(errors="replace")[-1000:]
+                    )
             if checkpoint:
                 checkpoint.parent.mkdir(parents=True, exist_ok=True)
                 temporary = checkpoint.with_suffix(".tmp")
@@ -1355,6 +1387,23 @@ def _start_cgroup_sampler(cluster: Cluster, namespace: str, pod: str, container:
     return process, handle
 
 
+def _start_shared_gateway_sampler(
+    cluster: Cluster, openshell_ns: str, out: Path,
+) -> list[tuple[subprocess.Popen[str], Any]]:
+    """Sample the shared gateway once for the run, never once per agent."""
+    pod = cluster.run(
+        ["-n", openshell_ns, "get", "pod", "-l", "app=openshell", "-o", "jsonpath={.items[0].metadata.name}"],
+        check=False,
+    ).strip()
+    if not pod:
+        return []
+    container = cluster.run(
+        ["-n", openshell_ns, "get", "pod", pod, "-o", "jsonpath={.spec.containers[0].name}"],
+        check=False,
+    ).strip() or "gateway"
+    return [_start_cgroup_sampler(cluster, openshell_ns, pod, container, out / "shared_openshell_gateway_cgroup.csv")]
+
+
 def _stop_cgroup_samplers(samplers: list[tuple[subprocess.Popen[str], Any]]) -> None:
     for process, _ in samplers:
         process.terminate()
@@ -1384,6 +1433,10 @@ CGROUP_SAMPLE_COLUMNS = (
     "memory_pressure_some_avg10",
     "memory_pressure_full_avg10",
     "io_pressure_some_avg10",
+    "memory_inactive_file_bytes",
+    "memory_working_set_bytes",
+    "memory_anon_bytes",
+    "memory_file_bytes",
 )
 
 
@@ -1414,7 +1467,7 @@ def _merge_sandbox_cgroup_samples(cgroup_dir: Path, expected_quota: str = "") ->
     unbounded sandbox fail the run instead of producing invalid measurements.
     """
     raw_dir = cgroup_dir / "sandbox_samples"
-    rows: list[dict[str, str]] = []
+    sources: dict[str, list[dict[str, str]]] = {}
     expected_ratio = (
         _cpu_quota_ratio(*expected_quota.split()) if expected_quota else None
     )
@@ -1449,14 +1502,97 @@ def _merge_sandbox_cgroup_samples(cgroup_dir: Path, expected_quota: str = "") ->
                     merged["epoch_ns"] = str(epoch_ns)
                     merged["cpu_usage_usec"] = str(cpu_usage_usec)
                     merged["memory_bytes"] = str(memory_bytes)
-                    rows.append(merged)
+                    sources.setdefault(path.name, []).append(merged)
         except OSError:
             continue
-    if expected_ratio is not None and not rows:
+    if expected_ratio is not None and not any(sources.values()):
         raise RuntimeError(
             f"sandbox CPU quota {expected_quota} was not observed in any cgroup sample"
         )
-    rows.sort(key=lambda row: int(row["epoch_ns"]))
+    for source_rows in sources.values():
+        source_rows.sort(key=lambda row: int(row["epoch_ns"]))
+        if any(
+            int(current["cpu_usage_usec"]) < int(previous["cpu_usage_usec"])
+            for previous, current in zip(source_rows, source_rows[1:])
+        ):
+            raise RuntimeError("sandbox CPU counter reset within one sampler series")
+
+    if len(sources) <= 1:
+        rows = next(iter(sources.values()), [])
+    else:
+        # A cumulative counter cannot be concatenated across cgroups: a rate
+        # computed between pod A and pod B would be meaningless. Interpolate
+        # each pod's counter on the union of timestamps, subtract its initial
+        # value, then sum the increments. Before its first sample a pod adds
+        # zero; after its last sample its counter remains constant.
+        counter_columns = (
+            "cpu_usage_usec", "user_usec", "system_usec", "nr_throttled",
+            "throttled_usec", "cpu_pressure_some_total", "cpu_pressure_full_total",
+        )
+        gauge_columns = (
+            "cpu_pressure_some_avg10", "cpu_pressure_full_avg10",
+            "memory_pressure_some_avg10", "memory_pressure_full_avg10",
+            "io_pressure_some_avg10",
+        )
+        timelines = [
+            ([int(row["epoch_ns"]) for row in source_rows], source_rows)
+            for source_rows in sources.values() if source_rows
+        ]
+        timestamps = sorted({timestamp for times, _ in timelines for timestamp in times})
+        rows = []
+        for timestamp in timestamps:
+            aggregate: dict[str, str] = {column: "0" for column in CGROUP_SAMPLE_COLUMNS}
+            aggregate["epoch_ns"] = str(timestamp)
+            counters = {column: 0.0 for column in counter_columns}
+            gauges = {column: 0.0 for column in gauge_columns}
+            memory = 0
+            working_set = 0
+            inactive_file = 0
+            memory_anon = 0
+            memory_file = 0
+            quota_cores = 0.0
+            for times, source_rows in timelines:
+                position = bisect_right(times, timestamp) - 1
+                if position < 0:
+                    continue
+                first = source_rows[0]
+                before = source_rows[position]
+                after = source_rows[position + 1] if position + 1 < len(source_rows) else before
+                fraction = (
+                    (timestamp - times[position]) / (times[position + 1] - times[position])
+                    if position + 1 < len(times) and times[position + 1] > times[position]
+                    else 0.0
+                )
+                for column in counter_columns:
+                    left = float(before[column])
+                    right = float(after[column])
+                    baseline = float(first[column])
+                    counters[column] += max(0.0, left + fraction * (right - left) - baseline)
+                if timestamp <= times[-1]:
+                    memory += int(before["memory_bytes"])
+                    working_set += int(before["memory_working_set_bytes"])
+                    inactive_file += int(before["memory_inactive_file_bytes"])
+                    memory_anon += int(before["memory_anon_bytes"])
+                    memory_file += int(before["memory_file_bytes"])
+                    quota_cores += _cpu_quota_ratio(before.get("cpu_quota"), before.get("cpu_period")) or 0.0
+                    for column in gauge_columns:
+                        gauges[column] = max(gauges[column], float(before[column]))
+            aggregate["memory_bytes"] = str(memory)
+            aggregate["memory_working_set_bytes"] = str(working_set)
+            aggregate["memory_inactive_file_bytes"] = str(inactive_file)
+            aggregate["memory_anon_bytes"] = str(memory_anon)
+            aggregate["memory_file_bytes"] = str(memory_file)
+            aggregate["cpu_quota"] = str(round(quota_cores * 100000)) if quota_cores else "max"
+            aggregate["cpu_period"] = "100000"
+            aggregate.update({column: str(round(value)) for column, value in counters.items()})
+            aggregate.update({column: str(value) for column, value in gauges.items()})
+            rows.append(aggregate)
+        (cgroup_dir / "openshell_sandbox_merge.json").write_text(json.dumps({
+            "schema": "agentic.trace-replay.sandbox-cgroup-merge.v1",
+            "sources": sorted(sources),
+            "method": "sum per-sandbox baseline-subtracted counters at union timestamps; sum active memory gauges",
+            "pressure_avg10_method": "max of active sources; inspect raw sandbox_samples for per-pod values",
+        }, indent=2) + "\n", encoding="utf-8")
     output = cgroup_dir / "openshell_sandbox.csv"
     with output.open("w", encoding="utf-8") as handle:
         handle.write(",".join(CGROUP_SAMPLE_COLUMNS) + "\n")
@@ -1552,6 +1688,7 @@ def _collect_backend_events(
     backend: Any,
     session_id: str,
     start: float,
+    trace_ids: set[str],
 ) -> list[dict[str, Any]]:
     """Collect only the current session from the resolved backend deployment.
 
@@ -1561,7 +1698,23 @@ def _collect_backend_events(
     fall back to that endpoint through ``oc exec`` when the log stream is
     empty; this changes no backend or cluster state.
     """
+    if not trace_ids:
+        raise ValueError("current Jaeger trace IDs are required for backend event collection")
     since = datetime.fromtimestamp(max(0.0, start - 5.0), timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def current_events(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # A shared backend may retain older attempts with the same session,
+        # turn and call. Only events carrying this driver's Jaeger trace IDs
+        # are admissible; choose the latest matching duplicate.
+        latest: dict[tuple[Any, Any, str], dict[str, Any]] = {}
+        for event in candidates:
+            if str(event.get("trace_id") or "") not in trace_ids:
+                continue
+            key = (event.get("turn"), event.get("call"), str(event.get("tool") or ""))
+            previous = latest.get(key)
+            if previous is None or int(event.get("timestamp_unix_ns") or 0) >= int(previous.get("timestamp_unix_ns") or 0):
+                latest[key] = event
+        return list(latest.values())
     # Concurrent experiment controllers read the same shared backend log
     # stream.  A transient API/stream failure would otherwise look like "this
     # session emitted no events" and fail output validation, so retry an empty
@@ -1571,7 +1724,7 @@ def _collect_backend_events(
             ["-n", backend.namespace, "logs", f"deployment/{backend.name}", "--timestamps", "--since-time", since],
             check=False,
         )
-        events = _decode_json_log_events(logs, session_id, backend.event_name)
+        events = current_events(_decode_json_log_events(logs, session_id, backend.event_name))
         if events:
             return events
         if logs.strip() or attempt == 2:
@@ -1604,22 +1757,12 @@ def _collect_backend_events(
             continue
     if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
         return []
-    filtered: list[dict[str, Any]] = []
-    seen_positions: set[tuple[Any, Any, str]] = set()
-    for event in payload["events"]:
-        if not isinstance(event, dict):
-            continue
-        if event.get("event") != backend.event_name or str(event.get("session_id") or "") != session_id:
-            continue
-        # A retry can append the same turn/call again.  Keep one canonical
-        # event per recorded position so a valid retry is not rejected as a
-        # duplicate stream.
-        key = (event.get("turn"), event.get("call"), str(event.get("tool") or ""))
-        if key in seen_positions:
-            continue
-        seen_positions.add(key)
-        filtered.append(event)
-    return filtered
+    return current_events([
+        event for event in payload["events"]
+        if isinstance(event, dict)
+        and event.get("event") == backend.event_name
+        and str(event.get("session_id") or "") == session_id
+    ])
 
 
 def _preflight_pod_capacity(
@@ -1735,6 +1878,38 @@ def _capacity_aware_agent_assignments(
         else:
             raise RuntimeError("capacity-aware placement exhausted unexpectedly")
     return assignments
+
+
+def _balance_workloads_across_nodes(
+    queue: list[dict[str, Any]], capacity_assignments: list[str],
+) -> list[str]:
+    """Permute safe node slots so each workload is represented on each node.
+
+    The capacity planner determines how many agent slots each approved node
+    can host. A simple round-robin assignment to the interleaved workload
+    queue puts every SWE trace on one node in a two-node run. Reordering the
+    *same* safe slots removes that experiment-design confound.
+    """
+    if len(queue) != len(capacity_assignments):
+        raise ValueError("one queue entry is required per agent slot")
+    remaining = Counter(capacity_assignments)
+    original = Counter(capacity_assignments)
+    workload_node_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    assigned: list[str] = []
+    for item in queue:
+        workload = str(item.get("workload") or "")
+        node = min(
+            (candidate for candidate, slots in remaining.items() if slots > 0),
+            key=lambda candidate: (
+                workload_node_counts[workload][candidate] / original[candidate],
+                (original[candidate] - remaining[candidate]) / original[candidate],
+                candidate,
+            ),
+        )
+        assigned.append(node)
+        remaining[node] -= 1
+        workload_node_counts[workload][node] += 1
+    return assigned
 
 
 def _preflight_kueue_admission(
@@ -2132,14 +2307,23 @@ def ensure_workload_backends(
     """Deploy/check only explicitly configured, experiment-owned backends.
 
     A managed backend manifest must contain resources whose names begin with
-    ``trace-replay-``. Existing backends are observed and health-gated but never
-    restarted or edited. This function intentionally has no fallback to the
-    generic replay fixture.
+    ``trace-replay-``. Existing managed resources must carry this experiment's
+    ownership label before they are updated. Source changes roll only those
+    owned backend deployments. This function has no generic fixture fallback.
     """
     resolved: dict[str, Any] = {}
     for workload in allocation:
         spec = backends[workload]
         if spec.deployment_mode == "managed":
+            for kind, name in (("deployment", spec.name), ("service", spec.service)):
+                raw = cluster.run(["-n", spec.namespace, "get", kind, name, "-o", "json"], check=False).strip()
+                if raw:
+                    current = json.loads(raw)
+                    labels = current.get("metadata", {}).get("labels") or {}
+                    if labels.get("managed-by") != "trace-replay-experiment":
+                        raise RuntimeError(
+                            f"refusing to update unowned backend {kind} {spec.namespace}/{name}"
+                        )
             if not spec.manifest:
                 raise RuntimeError(f"managed backend {workload} has no manifest")
             manifest_path = Path(spec.manifest)
@@ -2278,6 +2462,7 @@ def _rewrite_queue_backend_endpoints(
     queue: list[dict[str, Any]],
     backends: dict[str, Any],
     endpoint_map: dict[str, str],
+    swe_script_root: Path | None = None,
 ) -> None:
     """Replace DNS backend URLs in queued sandbox commands with Service IPs."""
     for item in queue:
@@ -2318,6 +2503,14 @@ def _rewrite_queue_backend_endpoints(
                                 + "|base64 -d|python3"
                             )
                 tool["mapped_command"] = rewritten
+        if swe_script_root is not None and item.get("workload") == "software_engineering_qa":
+            session_id = str(session.get("session_id") or "")
+            script_dir = swe_script_root / hashlib.sha256(session_id.encode()).hexdigest()[:16]
+            for script in script_dir.glob("*.py"):
+                source = script.read_text(encoding="utf-8")
+                for workload, new_endpoint in endpoint_map.items():
+                    source = source.replace(backends[workload].base_url.rstrip("/"), new_endpoint.rstrip("/"))
+                script.write_text(source, encoding="utf-8")
 
 
 def _clone_config(
@@ -2632,10 +2825,12 @@ def deploy_agents(
         spec["volumes"].extend([{"name":"mock-src","configMap":{"name":source_name}}, *[{"name":f"mock-corpus-{i:03d}","configMap":{"name":name}} for i,name in enumerate(corpus_names)], {"name":"mock-edges","emptyDir":{}}])
         spec["containers"] = [c for c in spec.get("containers", []) if c.get("name") != "mock-llm"]
         _mock_env = [{"name":"REPLAY_CORPUS","value":"/data/corpus"},{"name":"REPLAY_MODE","value":"turns"},{"name":"REPLAY_TIMING","value":"humaneval-vllm-c1"},{"name":"MAP_TOOLS_TO_SANDBOX","value":"1"},{"name":"MOCK_EDGES_PATH","value":"/edges/mock_edges.jsonl"},{"name":"OTLP_ENDPOINT","value":f"http://{BASE_JAEGER}.{cluster.namespace}.svc.cluster.local:4318"}]
-        if simulated_ttft_ms is not None:
-            _mock_env.append({"name":"SIMULATED_TTFT_MS","value":str(simulated_ttft_ms)})
-        if simulated_itl_ms is not None:
-            _mock_env.append({"name":"SIMULATED_ITL_MS","value":str(simulated_itl_ms)})
+        if simulated_ttft_ms is not None or simulated_itl_ms is not None:
+            _mock_env.extend([
+                {"name": "SIMULATED_TIMING_OVERRIDE", "value": "1"},
+                {"name": "SIMULATED_TTFT_MS", "value": str(simulated_ttft_ms if simulated_ttft_ms is not None else 0)},
+                {"name": "SIMULATED_ITL_MS", "value": str(simulated_itl_ms if simulated_itl_ms is not None else 0)},
+            ])
         spec["containers"].append({"name":"mock-llm","image":"python:3.12-slim","command":["python","/app/mock_llm.py"],"ports":[{"name":"mock","containerPort":8080}],"env":_mock_env,"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"cpu":"1","memory":"512Mi"}},"readinessProbe":{"httpGet":{"path":"/health","port":"mock"},"initialDelaySeconds":1,"periodSeconds":2,"failureThreshold":30},"volumeMounts":[{"name":"mock-src","mountPath":"/app","readOnly":True}, *[{"name":f"mock-corpus-{i:03d}","mountPath":f"/data/corpus/part-{i:03d}","readOnly":True} for i in range(len(corpus_names))], {"name":"mock-edges","mountPath":"/edges"}]})
         return changed
 
@@ -3706,8 +3901,10 @@ def _appworld_command(session_id: str, turn: int, call: int, name: str, argument
     # A direct Python argv avoids that extra shell layer while retaining a
     # quote-safe base64 payload.
     code = (
-        "import base64 as b,json as j,urllib.request as u;"
-        f'p=b.b64decode("{payload}");'
+        "import base64 as b,json as j,os,urllib.request as u;"
+        f'p=j.loads(b.b64decode("{payload}"));'
+        "p['trace_id']=os.environ.get('TRACE_REPLAY_TRACE_ID','');"
+        "p['run_key']=os.environ.get('TRACE_REPLAY_RUN_KEY','');p=j.dumps(p).encode();"
         f'r=u.Request({endpoint_literal},p,{{"Content-Type":"application/json"}});'
         "x=j.loads(u.urlopen(r,timeout=180).read());"
         'v=x.get("result",x.get("error",x));'
@@ -3789,9 +3986,11 @@ def _workload_command(
         "arguments": arguments,
     }
     if (
-        workload == "research_deep_search"
-        and recorded_result_bytes is not None
-        and (name.endswith("__search") or name.endswith("__get_document"))
+        recorded_result_bytes is not None
+        and (
+            workload == "customer_support_ops"
+            or (workload == "research_deep_search" and (name.endswith("__search") or name.endswith("__get_document")))
+        )
     ):
         request["recorded_result_bytes"] = recorded_result_bytes
     payload = base64.b64encode(json.dumps(request, separators=(",", ":")).encode()).decode()
@@ -3799,6 +3998,8 @@ def _workload_command(
     code = (
         "import base64,json,os,sys,urllib.request,urllib.error;"
         f"p=json.loads(base64.b64decode('{payload}'));"
+        "p['trace_id']=os.environ.get('TRACE_REPLAY_TRACE_ID','');"
+        "p['run_key']=os.environ.get('TRACE_REPLAY_RUN_KEY','');"
         f"r=urllib.request.Request(os.environ.get('WORKLOAD_BACKEND_URL',{endpoint_literal})+'/execute',"
         "data=json.dumps(p).encode(),headers={'Content-Type':'application/json'});"
         "\ntry:\n response=json.loads(urllib.request.urlopen(r,timeout=180).read())"
@@ -3831,7 +4032,7 @@ def _swe_sandbox_command(
     tool_cpu_ids: tuple[int, ...] = (),
     tool_cgroup_quota: str = "",
 ) -> list[str]:
-    """Execute the recorded SWE command in the real task-image sandbox.
+    """Execute the recorded SWE command in an OpenShell sandbox with a staged checkout.
 
     The backend remains the audit/state boundary, but the repository command
     itself runs in OpenShell.  This prevents the benchmark service from
@@ -3853,6 +4054,8 @@ def _swe_sandbox_command(
     code = (
         "import base64,glob,json,os,resource,subprocess,sys,time,urllib.request,urllib.error;"
         f"p=json.loads(base64.b64decode('{payload}'));"
+        "p['trace_id']=os.environ.get('TRACE_REPLAY_TRACE_ID','');"
+        "p['run_key']=os.environ.get('TRACE_REPLAY_RUN_KEY','');"
         "a=p.get('arguments') or {};task=p.get('swe_task') or {};tool_name=str(p.get('tool') or '');"
         "command=str(a.get('command') or a.get('cmd') or '');"
         "repo_root='/sandbox/.openshell/workspace'\n"
@@ -3863,7 +4066,7 @@ def _swe_sandbox_command(
         "\ntry:\n"
         " if not os.path.isdir(repo_root) or not task.get('base_commit'):\n  raise RuntimeError('SWE workspace does not provide the staged /testbed repository')\n"
         " head=subprocess.run(['git','-C',cwd,'rev-parse','HEAD'],capture_output=True,text=True,timeout=20,check=False)\n"
-        " if head.returncode != 0 or head.stdout.strip() != str(task.get('base_commit')):\n  raise RuntimeError('SWE task image commit mismatch: expected '+str(task.get('base_commit'))+' observed '+head.stdout.strip())\n"
+        " if head.returncode != 0 or head.stdout.strip() != str(task.get('base_commit')):\n  raise RuntimeError('SWE staged repository commit mismatch: expected '+str(task.get('base_commit'))+' observed '+head.stdout.strip())\n"
         " verified_base_commit=head.stdout.strip()\n"
         " if command:\n"
         "  command=command.replace('/testbed',repo_root)\n"
@@ -4013,7 +4216,7 @@ def prepare_workload_corpus(
                     mapped[workload] += 1
                 elif workload == "software_engineering_qa":
                     arguments = dict(tool.get("arguments") or {})
-                    tool["mapped_command"] = _swe_sandbox_command(
+                    full_command = _swe_sandbox_command(
                         session_id,
                         workload,
                         benchmark,
@@ -4026,6 +4229,13 @@ def prepare_workload_corpus(
                         tool_cpu_ids,
                         tool_cgroup_quota,
                     )
+                    script_name = f"{int(turn.get('index', 0)):04d}-{call_index:03d}.py"
+                    script_dir = out.parent / "swe-tool-scripts" / hashlib.sha256(session_id.encode()).hexdigest()[:16]
+                    script_dir.mkdir(parents=True, exist_ok=True)
+                    (script_dir / script_name).write_text(full_command[2] + "\n", encoding="utf-8")
+                    tool["mapped_command"] = [
+                        "python3", f"/tmp/trace-replay-tool-calls/{script_name}",
+                    ]
                     mapped[workload] += 1
                 elif workload != "personal_assistant":
                     arguments = dict(tool.get("arguments") or {})
@@ -4063,7 +4273,40 @@ def prepare_workload_corpus(
         raise RuntimeError(f"backend mapping produced no calls for one or more workloads: {missing}")
     payload["tool_backend"] = "workload-specific"
     payload["backend_mapping_counts"] = mapped
+    payload["backend_fidelity"] = {
+        "software_engineering_qa": "real OpenShell commands against pinned source checkout; task-image dependencies are not guaranteed",
+        "personal_assistant": "stateful AppWorld API execution",
+        "research_deep_search": "local generated responses with recorded byte lengths where available; no live document service",
+        "customer_support_ops": "local generated responses with recorded byte lengths where available; no live support service",
+    }
     out.parent.mkdir(parents=True, exist_ok=True)
+    payload_rows = []
+    for session in payload.get("sessions") or []:
+        workload = str(session.get("workload") or "")
+        for turn in session.get("turns") or []:
+            for call_index, tool in enumerate(turn.get("tool_calls") or []):
+                command = tool.get("mapped_command") or []
+                original_bytes = len(json.dumps(tool.get("arguments") or {}, separators=(",", ":")).encode("utf-8"))
+                mapped_bytes = len(json.dumps({"command": shlex.join([str(part) for part in command])}).encode("utf-8"))
+                payload_rows.append({
+                    "session_id": session.get("session_id"), "workload": workload,
+                    "turn": turn.get("index"), "call": call_index,
+                    "recorded_args_bytes": original_bytes,
+                    "mapped_args_bytes_before_trace_headers": mapped_bytes,
+                    "recorded_result_bytes": (
+                        len(tool["recorded_result"].encode("utf-8"))
+                        if isinstance(tool.get("recorded_result"), str) else None
+                    ),
+                    "recorded_output_tokens_for_turn": turn.get("output_tokens"),
+                    "recorded_args_four_char_fragments": (original_bytes + 3) // 4,
+                    "mapped_args_four_char_fragments": (mapped_bytes + 3) // 4,
+                    "ratio": round(mapped_bytes / max(1, original_bytes), 3),
+                })
+    (out.parent / "tool_payload_fidelity.json").write_text(
+        json.dumps({"schema": "agentic.trace-replay.tool-payload-fidelity.v1",
+                    "scope": "arguments only; mapped byte count excludes trace/run environment headers",
+                    "calls": payload_rows}, indent=2) + "\n", encoding="utf-8"
+    )
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     log_phase(f"corpus: mapped workload tool calls through internal APIs ({mapped})")
     return out
@@ -4155,6 +4398,23 @@ def build_queue(
             if items:
                 queue.append(items.pop(0))
     queue = queue[:max_traces] if max_traces is not None else queue
+    nested_sessions = [
+        str(item["session"].get("session_id") or "") for item in queue
+        if audit_replay_session(item["session"])["nested_or_subagent_tools"]
+    ]
+    if nested_sessions:
+        raise RuntimeError(
+            "nested/subagent trajectories require a graph-aware replay harness: "
+            + ", ".join(nested_sessions[:10])
+        )
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "selected_trajectory_audit.json").write_text(
+        json.dumps({
+            "schema": "agentic.trace-replay.selected-trajectory-audit.v1",
+            "selected_sessions": len(queue),
+            "sessions": [audit_replay_session(item["session"]) for item in queue],
+        }, indent=2) + "\n", encoding="utf-8",
+    )
     _require_client_boundaries(queue)
     return queue
 
@@ -4230,16 +4490,17 @@ def create_trace_job(
     placement_node: str | None = None,
     prewarm_only: bool = False,
     user_key: str | None = None,
+    client_gap_ms: float = 0.0,
 ) -> tuple[str, str, Path, str]:
     workload = safe_name(item["workload"])
     index = int(item["index"])
     trace_dir = out / f"{index:03d}-{item['session']['session_id']}__{workload}"
     # Preserve incomplete attempt evidence outside the active result tree.
     # Retrying in-place would mix old mock edges with the new attempt.
-    if trace_dir.exists() and not (trace_dir / "trace.json").exists():
+    if attempt > 0 and trace_dir.exists():
         failed_root = out.parent / "failed-attempts" / trace_dir.name
         failed_root.mkdir(parents=True, exist_ok=True)
-        trace_dir.rename(failed_root / f"attempt-{int(time.time() * 1000)}")
+        trace_dir.rename(failed_root / f"attempt-{attempt}-{time.time_ns()}")
     trace_dir.mkdir(parents=True, exist_ok=True)
     corpus_path = trace_dir / "input_corpus.json"
     corpus_path.write_text(json.dumps({"dataset": "Exgentic/agent-llm-traces", "sessions": [item["session"]]}, indent=2))
@@ -4276,6 +4537,8 @@ def create_trace_job(
         # message.  The harness owns the tool loop in between, so a model turn
         # without a tool call never truncates the rest of the conversation.
         driver_args.append("--client-turns")
+        if client_gap_ms > 0:
+            driver_args.extend(["--client-gap-ms", str(client_gap_ms)])
     if prewarm_requested:
         driver_args.append("--prewarm")
     if prewarm_only:
@@ -4505,28 +4768,8 @@ def collect_trace(
     samplers = [
         _start_cgroup_sampler(cluster, cluster.namespace, openclaw_pod, "gateway", cgroup_dir / "openclaw_gateway.csv"),
     ]
-    # Sample the shared OpenShell gateway (control plane) so its CPU/memory
-    # under concurrent agent load is visible in the resource plots.
-    try:
-        _openshell_gw_pod = cluster.run(
-            ["-n", openshell_ns, "get", "pod", "-l", "app=openshell", "-o", "jsonpath={.items[0].metadata.name}"],
-            check=False,
-        ).strip()
-        if not _openshell_gw_pod:
-            _openshell_gw_pod = cluster.run(
-                ["-n", openshell_ns, "get", "pod", "-o", "jsonpath={.items[0].metadata.name}"],
-                check=False,
-            ).strip()
-        if _openshell_gw_pod:
-            _openshell_gw_containers = cluster.run(
-                ["-n", openshell_ns, "get", "pod", _openshell_gw_pod, "-o", "jsonpath={.spec.containers[0].name}"],
-                check=False,
-            ).strip() or "gateway"
-            samplers.append(
-                _start_cgroup_sampler(cluster, openshell_ns, _openshell_gw_pod, _openshell_gw_containers, cgroup_dir / "openshell_gateway.csv")
-            )
-    except Exception:
-        pass  # The OpenShell gateway sampler is best-effort; its absence does not fail the trace
+    # The OpenShell gateway is shared across agents. Its run-level sampler is
+    # started once by main(), not inside each per-agent cgroup window.
     lifecycle_records: dict[str, dict[str, Any]] = {}
     lifecycle_sampler_started: set[str] = set()
     # This flag is used by both lifecycle paths, including completed-Job recovery.
@@ -4702,22 +4945,16 @@ def collect_trace(
         sandbox_reuse_ms: float | None = None
         # Pool-fill evidence is durable run state. The per-trace watcher starts
         # after pool fill, so it cannot observe the already-ready sandbox itself.
-        # The requested run has a prefilled pool for every selected agent.
-        # The pool-fill helper raises on any unready slot before dispatch, so
-        # warm_pool_size is authoritative for this all-warm canary.
-        warm_pool_slot_ready = warm_pool_size > 0
+        # Pool size is global; only this agent's assigned slot can establish
+        # warm reuse. A partial pool must leave unassigned agents cold.
+        warm_pool_slot_ready = warm_pool_slot is not None
         try:
             pool_evidence = json.loads((trace_dir.parent.parent / "warm_pool_evidence.json").read_text(encoding="utf-8"))
-            warm_pool_slot_ready = warm_pool_slot_ready or any(
+            warm_pool_slot_ready = warm_pool_slot is not None and any(
                 isinstance(record, dict)
                 and record.get("status") == "ready"
-                and (
-                    record.get("session_id") == session_id
-                    or (
-                        record.get("agent") == agent
-                        and record.get("workspace") == workspace
-                    )
-                )
+                and record.get("agent") == agent
+                and record.get("workspace") == workspace
                 for record in pool_evidence
             )
         except (OSError, json.JSONDecodeError):
@@ -4750,7 +4987,7 @@ def collect_trace(
                     "sandbox filled before the measured trace; one-time pool-fill cost is in prewarm_request_ms"
                 )
             prewarm_status = "measured" if warmup_ms > 0 else "missing"
-        elif warm_pool_size > 0:
+        elif warm_pool_slot_ready:
             # Pool fill completed before dispatch and would have raised on failure.
             # The per-trace watcher starts after that fill, so it cannot be required
             # to rediscover the already-ready sandbox.
@@ -4855,7 +5092,7 @@ def collect_trace(
             )
             prewarm_status = "measured" if recovered_warmup_ms > 0 else "missing"
             readiness_evidence = "completed_pod_result_copy_after_prewarm"
-        elif warm_pool_size > 0:
+        elif warm_pool_slot is not None:
             lifecycle_status = "ready" if recovered_driver_ok else "not_ready"
             provisioning_mode = "warm_reused"
             sandbox_init_ms = 0.0
@@ -5052,7 +5289,7 @@ def collect_trace(
     analyze_per_turn(traces, shell / "prometheus", trace_dir / "analysis")
     backend_dir = trace_dir / ("data/appworld" if backend.benchmark == "appworld" else "data/backend")
     backend_dir.mkdir(parents=True, exist_ok=True)
-    session_events = _collect_backend_events(cluster, backend, session_id, start)
+    session_events = _collect_backend_events(cluster, backend, session_id, start, current_trace_ids)
     (backend_dir / "events.jsonl").write_text(
         "\n".join(json.dumps(event, separators=(",", ":")) for event in session_events)
         + ("\n" if session_events else ""),
@@ -5128,6 +5365,8 @@ def main() -> int:
         help="number of agent-scoped OpenShell sandboxes admitted to the prewarm pool; excess agents use cold-start fallback",
     )
     parser.add_argument("--traces-per-workload", type=int, default=5)
+    parser.add_argument("--client-gap-ms", type=float, default=0.0,
+                        help="controlled pause between recorded client messages")
     parser.add_argument("--max-traces", type=int, help="cap the total number of traces after workload partitioning")
     parser.add_argument("--trace-offset", type=int, default=0, help="skip this many sessions per workload before selecting traces")
     parser.add_argument("--require-traces", type=int, help="fail unless the final queue has exactly this many traces")
@@ -5454,6 +5693,8 @@ def main() -> int:
         parser.error("--workspace-pvc is required when reusing an existing run")
     if args.trace_offset < 0:
         parser.error("--trace-offset cannot be negative")
+    if args.client_gap_ms < 0:
+        parser.error("--client-gap-ms must be nonnegative")
     if args.agent_offset < 0 or args.agent_offset >= args.agents:
         parser.error("--agent-offset must be between 0 and agents-1")
     selected_session_ids = {value.strip() for value in (args.session_ids or "").split(",") if value.strip()}
@@ -5590,6 +5831,17 @@ def main() -> int:
         parser.error(f"expected exactly {args.require_traces} traces, found {len(queue)}")
     if selected_agent_indices and len(selected_agent_indices) != len(queue):
         parser.error("--agent-indices must contain exactly one agent index per selected trace")
+    # SWE repository transfer requires creating the OpenShell sandbox before
+    # measurement. Such a slot cannot also be presented as a cold sandbox
+    # sample, regardless of the requested partial warm-pool ratio.
+    for position, item in enumerate(queue):
+        slot = ((selected_agent_indices[position] - 1) if selected_agent_indices
+                else ((position + args.agent_offset) % args.agents))
+        if item["workload"] == "software_engineering_qa" and slot >= args.warm_pool_size:
+            parser.error(
+                f"SWE agent slot {slot + 1} must be in the warm pool because repository staging "
+                "creates its sandbox before measurement; increase --warm-pool-size or change the cohort"
+            )
     # Keep the OpenShell sandbox image generic and supported.  SWE-bench task
     # images are used by the staging Jobs below to copy the real repository
     # snapshot into the agent workspace; they are not used as OpenShell images
@@ -5597,6 +5849,7 @@ def main() -> int:
     swe_task_images_by_agent: list[str | None] = [None] * args.agents
     swe_tasks_by_agent: dict[int, dict[str, Any]] = {}
     swe_items_by_agent: dict[int, dict[str, Any]] = {}
+    swe_script_dirs_by_agent: dict[int, Path] = {}
     swe_assignments: dict[int, str] = {}
     for position, item in enumerate(queue):
         binding_index = (selected_agent_indices[position] - 1) if selected_agent_indices else ((position + args.agent_offset) % args.agents)
@@ -5617,6 +5870,9 @@ def main() -> int:
         swe_task_images_by_agent[binding_index] = image
         swe_tasks_by_agent[binding_index] = dict(task)
         swe_items_by_agent[binding_index] = item
+        swe_script_dirs_by_agent[binding_index] = (
+            args.out / "swe-tool-scripts" / hashlib.sha256(session_id.encode()).hexdigest()[:16]
+        )
     args.out.mkdir(parents=True, exist_ok=True)
     runtime_corpus = args.out / "runtime-replay-corpus.json"
     runtime_corpus.parent.mkdir(parents=True, exist_ok=True)
@@ -5859,6 +6115,8 @@ def main() -> int:
             target_nodes,
             additional_pods_by_node=additional_pods_by_node,
         )
+        if len(queue) == args.agents and not selected_agent_indices and args.agent_offset == 0:
+            agent_nodes = _balance_workloads_across_nodes(queue, agent_nodes)
         _preflight_pod_capacity(
             cluster,
             agent_nodes,
@@ -5870,7 +6128,10 @@ def main() -> int:
     # queued tool commands and the sandbox network policy.  This avoids any
     # cluster-wide DNS or policy changes.
     sandbox_backend_endpoints = _resolve_backend_service_endpoints(cluster, backends, allocation)
-    _rewrite_queue_backend_endpoints(queue, backends, sandbox_backend_endpoints)
+    _rewrite_queue_backend_endpoints(
+        queue, backends, sandbox_backend_endpoints,
+        args.out / "swe-tool-scripts",
+    )
     runtime_payload["sessions"] = [item["session"] for item in queue]
     runtime_corpus.write_text(json.dumps(runtime_payload, indent=2), encoding="utf-8")
     sandbox_internal_api_endpoints = [sandbox_backend_endpoints[workload] for workload in allocation]
@@ -6125,6 +6386,7 @@ def main() -> int:
         shared_workspace_pvcs,
         staging_node=auxiliary_job_node,
         checkpoint_dir=args.out,
+        scripts_by_agent=swe_script_dirs_by_agent,
     )
     # Repository staging already verified every commit directly on the exact
     # PVC subpath mounted by its OpenShell workspace.  The synthetic prewarm
@@ -6224,7 +6486,14 @@ def main() -> int:
             log_phase(f"telemetry: Jaeger port-forward restored at {jaeger_url}")
             return jaeger_url
 
+    shared_gateway_samplers: list[tuple[subprocess.Popen[str], Any]] = []
     try:
+        try:
+            shared_gateway_samplers = _start_shared_gateway_sampler(
+                cluster, args.openshell_namespace, args.out,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("shared OpenShell gateway sampler unavailable: %s", exc)
         _wait_for_jaeger(jaeger_url, pf)
         log_phase(f"telemetry: Jaeger ready at {jaeger_url}")
         errors_path = args.out / "errors.jsonl"
@@ -6258,6 +6527,19 @@ def main() -> int:
                 try:
                     log_phase(f"trace {position + 1}/{len(queue)}: {session_id} workload={item['workload']} agent={agent} attempt={attempt + 1}")
                     start = time.time()
+                    if attempt > 0 and item["workload"] == "software_engineering_qa":
+                        # The preceding attempt may have edited the staged
+                        # repository without moving HEAD. Recopy the pinned
+                        # snapshot into this run-owned workspace before any
+                        # diagnostic retry, bypassing the clean-stage cache.
+                        stage_swe_repositories(
+                            cluster, args.openshell_namespace, run_hash,
+                            {binding_index: swe_tasks_by_agent[binding_index]},
+                            workspace_names, agent_nodes, shared_workspace_pvcs,
+                            staging_node=auxiliary_job_node,
+                            checkpoint_dir=None,
+                            scripts_by_agent={binding_index: swe_script_dirs_by_agent[binding_index]},
+                        )
                     # Kubernetes Jobs are immutable; include a per-process
                     # suffix so reruns never reuse a completed Job name.
                     # The suffix must also be unique when several experiment
@@ -6287,6 +6569,7 @@ def main() -> int:
                             if item["workload"] == "software_engineering_qa"
                             else None
                         ),
+                        client_gap_ms=args.client_gap_ms,
                     )
                     try:
                         collect_trace(
@@ -6340,9 +6623,27 @@ def main() -> int:
                             jaeger_io_lock=jaeger_io_lock,
                             expected_cgroup_quota=tool_cgroup_quota,
                         )
+                    metadata_path = trace_dir / "trace.json"
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    metadata["attempt_number"] = attempt + 1
+                    metadata["attempts_requested"] = args.retries + 1
+                    metadata["benchmark_eligible"] = attempt == 0
+                    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+                    with errors_lock:
+                        with (args.out / "attempts.jsonl").open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps({"session_id": session_id, "position": position,
+                                                     "agent": agent, "attempt": attempt + 1,
+                                                     "ok": True, "start_unix": start,
+                                                     "end_unix": time.time()}) + "\n")
                     log_phase(f"trace complete: {trace_dir}")
                     return {"position": position, "session_id": session_id, "agent": agent, "ok": True, "attempt": attempt + 1}
                 except Exception as exc:
+                    with errors_lock:
+                        with (args.out / "attempts.jsonl").open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps({"session_id": session_id, "position": position,
+                                                     "agent": agent, "attempt": attempt + 1,
+                                                     "ok": False, "start_unix": locals().get("start"),
+                                                     "end_unix": time.time(), "error": str(exc)}) + "\n")
                     if trace_dir is not None and job:
                         try:
                             failure_log = cluster.run(
@@ -6401,6 +6702,7 @@ def main() -> int:
         if failed:
             raise RuntimeError(f"{len(failed)} traces failed; see {errors_path}")
     finally:
+        _stop_cgroup_samplers(shared_gateway_samplers)
         pf.send_signal(signal.SIGTERM)
         pf.wait(timeout=10)
     (args.out / "experiment.json").write_text(json.dumps({

@@ -180,6 +180,8 @@ def derive_per_turn(
 
     rows: list[dict] = []
     for (sid, _run_tid), sedges in by_run.items():
+        has_warmup = any(e.get("warmup") for e in sedges)
+        sedges = [e for e in sedges if not e.get("warmup")]
         real = [e for e in sedges if not e.get("phantom") and not e.get("exhausted") and not e.get("miss")]
         # G[i] from the FULL ordered edge list (needs the next call's t_recv, even if terminal).
         recv_by_seq = {e.get("turn_seq"): e.get("t_recv_ns") for e in sedges}
@@ -191,8 +193,11 @@ def derive_per_turn(
             tinfo = tidx.get(trace_id)
 
             # --- C: model TTFT (mock authoritative) ---------------------------
-            c_primary = e.get("ttft_set_ms")
-            c_cross_mock = e.get("ttft_measured_ms")
+            c_configured = e.get("ttft_set_ms")
+            c_primary = e.get("ttft_measured_ms")
+            c_cross_mock = c_configured
+            if c_primary is None:
+                c_primary = c_configured
 
             # --- E: model decode (mock authoritative) -------------------------
             # The mock's decode_set covers ALL streamed tokens INCLUDING the
@@ -202,7 +207,9 @@ def derive_per_turn(
             # then the visible-token streaming only.
             reasoning_ms = e.get("reasoning_set_ms") or 0.0
             response_tail_ms = e.get("response_processing_tail_ms") or 0.0
-            decode_total = e.get("decode_set_ms")
+            decode_total = e.get("decode_measured_ms")
+            if decode_total is None:
+                decode_total = e.get("decode_set_ms")
             e_primary = (round(max(0.0, decode_total - reasoning_ms), 3)
                          if decode_total is not None else None)
             e_cross_mock = e.get("decode_measured_ms")
@@ -351,7 +358,10 @@ def derive_per_turn(
                 if e_primary is not None:
                     openclaw_response_only_ms = round(response_cycle_ms - e_primary, 3)
 
-            is_cold = pos == 0
+            # The first model call is not proof of sandbox creation. A warmup
+            # may already have acquired it, and a client session may span
+            # several Jaeger traces. Unknown is safer than a false cold label.
+            is_cold = (False if has_warmup or pos > 0 else True if cold_ready_ms is not None else None)
             row = {
                 "session_id": sid,
                 "turn_seq": seq,
@@ -371,6 +381,7 @@ def derive_per_turn(
                 # Bucket C (model TTFT). Includes prefill of the uncached context:
                 # cold turn-0 (whole prompt) vs warm delta -- exposed separately.
                 "C_ttft_ms": c_primary,
+                "C_ttft_configured_ms": c_configured,
                 "C_ttft_measured_ms": c_cross_mock,
                 "C_ttft_openclaw_ms": c_cross_ocw,
                 "C_ttft_delta_measured": _agree(c_primary, c_cross_mock),
@@ -447,7 +458,7 @@ def summarize(rows: list[dict]) -> dict[str, Any]:
         }
 
     cold = [r for r in rows if r.get("is_cold_sandbox")]
-    warm = [r for r in rows if not r.get("is_cold_sandbox")]
+    warm = [r for r in rows if r.get("is_cold_sandbox") is False]
     cold_b = [r["B_sandbox_ms"] for r in cold if r.get("B_sandbox_ms") is not None]
     warm_b = [r["B_sandbox_ms"] for r in warm if r.get("B_sandbox_ms") is not None]
 

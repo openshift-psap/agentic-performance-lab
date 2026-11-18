@@ -527,6 +527,9 @@ class ReplayIndex:
         # back to session_id so single-session sequential replay still advances.
         blob = json.dumps(payload, ensure_ascii=False)
         counter_key = trace_id or session_id
+        run_matches = list(re.finditer(r"REPLAY_RUN_KEY=([0-9a-fA-F]{32})", blob))
+        run_key = run_matches[-1].group(1).lower() if run_matches else ""
+        prefill_key = run_key or counter_key
         # A client boundary is explicit and only applies to the first model
         # request in that OpenClaw request trace. Subsequent model calls share
         # the trace id and advance naturally after real tool results.
@@ -554,7 +557,7 @@ class ReplayIndex:
         # the second warmup response is terminal and the measured trace starts
         # only after this lifecycle has completed.
         if "REPLAY_WARMUP=1" in last_user_text(payload):
-            warmup_key = trace_id or session_id
+            warmup_key = prefill_key
             with self.lock:
                 first_warmup = warmup_key not in self._warmup_done
                 if first_warmup:
@@ -568,13 +571,15 @@ class ReplayIndex:
                         "arguments": {"command": "true"},
                         "mapped_command": ["true"],
                     }],
-                    "prefill_key": trace_id or session_id, "input_tokens": 1, "output_tokens": 1,
+                    "prefill_key": prefill_key, "replay_run_key": run_key,
+                    "input_tokens": 1, "output_tokens": 1,
                     "reasoning_tokens": 0, "duration_ms": 0.0, "finish_reason": "tool_calls",
                     "miss": False, "phantom": False, "exhausted": False, "warmup": True,
                 }
             return {
                 "session_id": session_id, "turn_seq": -1, "content": "warmup", "tool_calls": [],
-                "prefill_key": trace_id or session_id, "input_tokens": 1, "output_tokens": 1,
+                "prefill_key": prefill_key, "replay_run_key": run_key,
+                "input_tokens": 1, "output_tokens": 1,
                 "reasoning_tokens": 0, "duration_ms": 0.0, "finish_reason": "stop",
                 "miss": False, "phantom": False, "exhausted": False, "warmup": True,
             }
@@ -587,6 +592,7 @@ class ReplayIndex:
                 "output_tokens": int(session.get("output_tokens_first") or max(1, len(content) // 4)),
                 "duration_ms": float(session.get("first_llm_duration_ms") or 0.0),
                 "finish_reason": "stop", "miss": False, "phantom": False, "exhausted": False,
+                "prefill_key": prefill_key, "replay_run_key": run_key,
             }
 
         turns = session.get("turns") or []
@@ -596,6 +602,7 @@ class ReplayIndex:
                 "session_id": session_id, "turn_seq": turn_seq, "content": "done", "tool_calls": [],
                 "input_tokens": 0, "output_tokens": 1, "duration_ms": 0.0,
                 "finish_reason": "stop", "miss": False, "phantom": False, "exhausted": True,
+                "prefill_key": prefill_key, "replay_run_key": run_key,
             }
 
         turn = turns[turn_seq]
@@ -613,7 +620,7 @@ class ReplayIndex:
             return {
                 "session_id": session_id, "turn_seq": turn_seq,
                 "content": content or "ok", "tool_calls": [],
-                "prefill_key": counter_key,
+                "prefill_key": prefill_key, "replay_run_key": run_key,
                 "input_tokens": int(turn.get("input_tokens") or 0),
                 "output_tokens": max(1, int(turn.get("output_tokens") or 0)),
                 "reasoning_tokens": 0, "duration_ms": 0.0,
@@ -629,7 +636,7 @@ class ReplayIndex:
             "session_id": session_id, "turn_seq": turn_seq, "content": content, "tool_calls": tool_calls,
             # Per-run key (== turn-counter key): a fresh trace/rep resets the prefix
             # cache so each rep's turn 0 is a genuine cold prefill, not a cache hit.
-            "prefill_key": counter_key,
+            "prefill_key": prefill_key, "replay_run_key": run_key,
             "input_tokens": int(turn.get("input_tokens") or 0),
             "output_tokens": int(turn.get("output_tokens") or (0 if phantom else max(1, len(content) // 4))),
             "reasoning_tokens": turn.get("reasoning_tokens"),
@@ -663,9 +670,15 @@ class ReplayIndex:
 # Tool-call encoding.                                                          #
 # --------------------------------------------------------------------------- #
 
-def _sandbox_exec_args(mapped_command: list[Any] | None) -> str:
+def _sandbox_exec_args(
+    mapped_command: list[Any] | None, trace_id: str = "", run_key: str = "",
+) -> str:
     """Encode the trace's replay command for OpenClaw's owned ``exec`` tool."""
     command = shlex.join([str(part) for part in (mapped_command or ["echo", "ok"])])
+    if re.fullmatch(r"[0-9a-fA-F]{32}", trace_id):
+        command = f"TRACE_REPLAY_TRACE_ID={trace_id.lower()} {command}"
+    if re.fullmatch(r"[0-9a-fA-F]{32}", run_key):
+        command = f"TRACE_REPLAY_RUN_KEY={run_key.lower()} {command}"
     return json.dumps({"command": command})
 
 
@@ -735,7 +748,9 @@ def reasoning_stream(n_tokens: int) -> list[str]:
     return [_REASONING_FILLER[i % len(_REASONING_FILLER)] for i in range(n_tokens)]
 
 
-def openai_tool_calls(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def openai_tool_calls(
+    raw: list[dict[str, Any]], *, trace_id: str = "", run_key: str = "",
+) -> list[dict[str, Any]]:
     encoded = []
     to_sandbox = os.environ.get("MAP_TOOLS_TO_SANDBOX", "") == "1"
     for index, item in enumerate(raw):
@@ -743,7 +758,7 @@ def openai_tool_calls(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
         name = item.get("name") or "true"
         if to_sandbox:
             name = "exec"
-            arguments = _sandbox_exec_args(item.get("mapped_command"))
+            arguments = _sandbox_exec_args(item.get("mapped_command"), trace_id, run_key)
         elif not isinstance(arguments, str):
             arguments = json.dumps(arguments)
         encoded.append({
@@ -861,7 +876,12 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
         # -- streaming response with edge recording ---------------------------
         def _sse(self, replay: dict[str, Any], model: str, traceparent: str, t_recv_ns: int, t_recv_wall_ns: int, payload: dict[str, Any]) -> None:
             content = _assistant_content(replay)
-            tool_calls_raw = openai_tool_calls(replay.get("tool_calls") or [])
+            parsed_parent = parse_traceparent(traceparent)
+            tool_calls_raw = openai_tool_calls(
+                replay.get("tool_calls") or [],
+                trace_id=parsed_parent[0] if parsed_parent else "",
+                run_key=str(replay.get("replay_run_key") or ""),
+            )
             if os.environ.get("SINGLE_TURN_MODE", "") == "1":
                 tool_calls_raw = []
                 if not content:
@@ -888,12 +908,20 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
             # the calibrated timing profile with explicit per-request values.
             # This enables controlled stress experiments (e.g., near-instant
             # model responses to measure the infrastructure ceiling).
+            simulated_override = (
+                os.environ.get("SIMULATED_TIMING_OVERRIDE") == "1"
+                or "SIMULATED_TTFT_MS" in os.environ
+                or "SIMULATED_ITL_MS" in os.environ
+            )
             _sim_ttft_ms = float(os.environ.get("SIMULATED_TTFT_MS", "0") or 0)
             _sim_itl_ms = float(os.environ.get("SIMULATED_ITL_MS", "0") or 0)
-            if _sim_ttft_ms > 0 or _sim_itl_ms > 0:
+            if simulated_override and timing != "instant" and not replay.get("phantom"):
+                if _sim_ttft_ms < 0 or _sim_itl_ms < 0:
+                    raise ValueError("simulated TTFT and ITL must be non-negative")
                 ttft_s = _sim_ttft_ms / 1000.0
                 itl_s = _sim_itl_ms / 1000.0
-                decode_s = itl_s * output_tokens
+                decode_s = itl_s * max(0, output_tokens - 1)
+                new_ctx_tokens = 0  # simulated timing does not apply calibrated prefill
                 profile = "simulated"
             decode_budget = [decode_s]
             first_visible_emit_ns = 0
@@ -929,6 +957,8 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
             # header(s), then the arguments as ~4-char fragments; any leftover token
             # budget is filled with word-like filler so no delta is empty.
             first = [True]
+            emitted_chunks = [0]
+            stream_interval_s = itl_s
 
             def emit(delta: dict[str, Any]) -> None:
                 nonlocal first_visible_emit_ns, first_tool_emit_ns, reasoning_phase
@@ -938,9 +968,10 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                 if first_tool_emit_ns == 0 and delta.get("tool_calls"):
                     first_tool_emit_ns = now_ns
                 if not first[0]:
-                    take_decode(itl_s)
+                    take_decode(stream_interval_s)
                 delta = {"role": "assistant", **delta} if first[0] else delta
                 first[0] = False
+                emitted_chunks[0] += 1
                 self._write_sse({
                     "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
@@ -980,6 +1011,12 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                     n = max(1, -(-len(args) // 4))  # ceil(len/4)
                     arg_frags.append(_even_chunks(args, n) or [args])
                 total_arg_frags = sum(len(f) for f in arg_frags)
+                # The mapped local command can require more SSE fragments than
+                # the recorded model's output-token count. Spread the same
+                # configured decode budget over *all* fragments instead of
+                # pacing the first tokens and bursting the rest at zero delay.
+                total_fragments = max(output_tokens, headers + total_arg_frags)
+                stream_interval_s = decode_s / max(1, total_fragments - 1)
                 # Reasoning preamble first (buffered/classified by OpenClaw), then
                 # visible content fills the rest so total deltas track output_tokens.
                 budget = max(0, output_tokens - headers - total_arg_frags)
@@ -1026,6 +1063,8 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                 prefill_new_tokens=new_ctx_tokens, response_tail_ms=response_tail_ms,
                 first_visible_emit_ns=first_visible_emit_ns or t_first_emit_ns,
                 first_tool_emit_ns=first_tool_emit_ns or t_end_emit_ns,
+                streamed_chunks=emitted_chunks[0],
+                stream_chunk_interval_s=stream_interval_s,
             )
             if response_tail_ms > 0:
                 time.sleep(response_tail_ms / 1000.0)
@@ -1037,7 +1076,8 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                              t_first_emit_ns, t_end_emit_ns, ttft_s, itl_s, decode_s, profile,
                              output_tokens, input_tokens, recorded_ms, finish_reason, n_tool_calls,
                               reasoning_tokens=0, prefill_new_tokens=0, response_tail_ms=0.0,
-                              first_visible_emit_ns=0, first_tool_emit_ns=0) -> None:
+                              first_visible_emit_ns=0, first_tool_emit_ns=0,
+                              streamed_chunks=0, stream_chunk_interval_s=0.0) -> None:
             tp = parse_traceparent(traceparent)
             trace_id, parent_span_id = (tp if tp else ("", ""))
             stats = prompt_stats(assembled_prompt_text(payload))
@@ -1066,6 +1106,8 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                 # controlled inputs
                 "ttft_set_ms": round(ttft_s * 1000, 3),
                 "itl_set_ms": round(itl_s * 1000, 3),
+                "streamed_chunks": streamed_chunks,
+                "stream_chunk_interval_ms": round(stream_chunk_interval_s * 1000, 6),
                 "decode_set_ms": round(decode_s * 1000, 3),
                 # Reasoning preamble buffered by the gateway BEFORE the first visible
                 # token (the baseline's "Response Processing" cost). Carved from the
@@ -1151,6 +1193,9 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                 index.reset()
                 self._send(200, {"ok": True})
                 return
+            if path not in {"/v1/chat/completions", "/chat/completions", "/v1/responses", "/responses"}:
+                self._send(404, {"error": f"no handler for {path}"})
+                return
 
             t_recv_ns = time.perf_counter_ns()
             t_recv_wall_ns = time.time_ns()
@@ -1194,8 +1239,6 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                     n_tool_calls=len(replay.get("tool_calls") or []),
                 )
                 return
-            self._send(404, {"error": f"no handler for {path}"})
-
     return Handler
 
 

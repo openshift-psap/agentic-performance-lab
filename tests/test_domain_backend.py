@@ -63,3 +63,35 @@ def test_research_results_match_recorded_byte_length(tmp_path):
         assert len(result.encode("utf-8")) == 7005
         assert isinstance(json.loads(result), expected_type)
         assert "Synthetic research text" in result
+
+
+def test_run_key_isolates_repeated_session_state_and_support_size(tmp_path):
+    support = DomainBackend("customer_support_ops", tmp_path / "support")
+    request = {"session_id": "same", "benchmark": "tau2_airline", "tool": "message",
+               "arguments": {"text": "hello"}, "recorded_result_bytes": 312}
+    first = support.execute({**request, "run_key": "a" * 32})
+    second = support.execute({**request, "run_key": "b" * 32})
+    assert len(first["result"].encode("utf-8")) == 312
+    assert len(second["result"].encode("utf-8")) == 312
+    assert first["state_version"] == second["state_version"] == 1
+    assert len(support.sessions) == 2
+
+
+def test_swe_backend_marks_missing_dependency_even_when_shell_exit_is_zero(tmp_path):
+    backend = DomainBackend("software_engineering_qa", tmp_path / "swe")
+    backend.execute({
+        "session_id": "swe-missing-dependency",
+        "benchmark": "swebench",
+        "tool": "mcp__environment__bash",
+        "arguments": {"command": "pytest -q | tee test.log"},
+        "execution_mode": "sandbox",
+        "sandbox_result": {
+            "output": "ModuleNotFoundError: No module named 'pytest'",
+            "returncode": 0,
+            "repo_root": "/testbed",
+            "base_commit": "abc",
+        },
+        "turn": 0,
+        "call": 0,
+    })
+    assert backend.events[-1]["sandbox_dependency_failure"] is True

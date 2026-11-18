@@ -157,6 +157,27 @@ def test_compute_timing_uses_profile_not_duration():
     assert decode_one == 0.0
 
 
+def test_replay_run_key_survives_client_boundaries_without_sharing_other_runs():
+    session = {"session_id": "s", "user_prompt": "start", "turns": [
+        {"index": 0, "content": "one", "input_tokens": 10, "output_tokens": 1, "tool_calls": []},
+        {"index": 1, "content": "two", "input_tokens": 20, "output_tokens": 1, "tool_calls": []},
+    ]}
+    index = ReplayIndex({"sessions": [session], "by_id": {"s": session}})
+    key = "a" * 32
+    def request(turn):
+        return {"messages": [{"role": "user", "content":
+            f"REPLAY_SESSION_ID=s\nREPLAY_RUN_KEY={key}\n<!--replay-client-turn:{turn}-->start"}]}
+    first = index.resolve(request(0), "turns", trace_id="1" * 32)
+    second = index.resolve(request(1), "turns", trace_id="2" * 32)
+    assert first["prefill_key"] == second["prefill_key"] == key
+    assert [first["turn_seq"], second["turn_seq"]] == [0, 1]
+    other = index.resolve({"messages": [{"role": "user", "content":
+        "REPLAY_SESSION_ID=s\nREPLAY_RUN_KEY=" + "b" * 32 + "\n<!--replay-client-turn:0-->start"}]},
+        "turns", trace_id="3" * 32)
+    assert other["turn_seq"] == 0
+    assert other["prefill_key"] != first["prefill_key"]
+
+
 def test_prefill_cold_turn0_warm_after(monkeypatch):
     """Prefix-cache aware prefill: cold turn-0 prefills the whole context, warm
     turns only the per-turn delta -- reproducing the baseline 51ms->804ms jump on
@@ -261,6 +282,38 @@ def test_phantom_turn_detection():
     assert is_phantom_turn({"output_tokens": 0, "input_tokens": 0, "content": "", "tool_calls": []})
     assert not is_phantom_turn({"output_tokens": 5, "content": "hi", "tool_calls": []})
     assert not is_phantom_turn({"output_tokens": 0, "content": "", "tool_calls": [{"id": "x"}]})
+
+
+def test_mapped_tool_stream_uses_full_decode_budget_and_explicit_zero(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(mock_llm, "OTLP_ENDPOINT", "")
+    monkeypatch.setenv("MAP_TOOLS_TO_SANDBOX", "1")
+    monkeypatch.setenv("SIMULATED_TTFT_MS", "0")
+    monkeypatch.setenv("SIMULATED_ITL_MS", "5")
+    corpus = tmp_path / "mapped.json"
+    corpus.write_text(json.dumps({"sessions": [{
+        "session_id": "mapped-1",
+        "turns": [{"index": 0, "content": "", "input_tokens": 12, "output_tokens": 4,
+                   "tool_calls": [{"name": "bash", "arguments": {"command": "true"},
+                                   "mapped_command": ["python3", "-c", "print('x' * 200)"]}]}],
+    }]}), encoding="utf-8")
+    edges = tmp_path / "edges.jsonl"
+    port = _free_port()
+    threading.Thread(target=serve, kwargs={
+        "host": "127.0.0.1", "port": port, "corpus_path": str(corpus),
+        "mode": "turns", "timing": "humaneval-vllm-c1", "edges_path": str(edges),
+    }, daemon=True).start()
+    _wait_ready(port)
+    _stream_deltas(port, "<!--replay-session:mapped-1--> run", trace_id="e" * 32)
+    first = json.loads(edges.read_text(encoding="utf-8").splitlines()[-1])
+    assert first["ttft_set_ms"] == 0
+    assert first["decode_set_ms"] == 15
+    assert first["streamed_chunks"] > 4
+    assert 0 < first["stream_chunk_interval_ms"] < 5
+
+    monkeypatch.setenv("SIMULATED_ITL_MS", "0")
+    _stream_deltas(port, "<!--replay-session:mapped-1--> run", trace_id="f" * 32)
+    second = json.loads(edges.read_text(encoding="utf-8").splitlines()[-1])
+    assert second["ttft_set_ms"] == second["decode_set_ms"] == 0
 
 
 def test_start_only_replay_advances_without_driver_turn_tags():

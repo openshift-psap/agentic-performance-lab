@@ -64,10 +64,19 @@ def prom_values(path: Path) -> list[float]:
     ]
 
 
-def cgroup_stats(path: Path) -> dict[str, float | int | None]:
-    """Summarize the run-local cgroup-v2 sampler, not a namespace aggregate."""
+def cgroup_stats(
+    path: Path, *, start_unix: float | None = None, end_unix: float | None = None,
+) -> dict[str, float | int | None]:
+    """Summarize cgroup samples in the measured driver window only."""
+    optional_memory = {
+        "memory_working_set_bytes": "working_set",
+        "memory_inactive_file_bytes": "inactive_file",
+        "memory_anon_bytes": "anon",
+        "memory_file_bytes": "file",
+    }
     try:
         rows = []
+        extra: dict[str, list[float]] = {name: [] for name in optional_memory.values()}
         with path.open(encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
                 try:
@@ -79,7 +88,19 @@ def cgroup_stats(path: Path) -> dict[str, float | int | None]:
                     # the valid measurements around it.
                     continue
                 if epoch > 0 and cpu >= 0 and memory >= 0:
-                    rows.append((epoch / 1e9, cpu, memory))
+                    timestamp = epoch / 1e9
+                    if start_unix is not None and timestamp < start_unix:
+                        continue
+                    if end_unix is not None and timestamp > end_unix:
+                        continue
+                    rows.append((timestamp, cpu, memory))
+                    for column, name in optional_memory.items():
+                        value = row.get(column)
+                        if value not in (None, ""):
+                            try:
+                                extra[name].append(float(value) / 1024 / 1024)
+                            except ValueError:
+                                pass
     except (OSError, UnicodeDecodeError, csv.Error):
         return {"samples": 0, "cpu_peak_cores": None, "cpu_mean_cores": None, "memory_peak_mib": None, "memory_mean_mib": None}
     if len(rows) < 2:
@@ -91,13 +112,17 @@ def cgroup_stats(path: Path) -> dict[str, float | int | None]:
         if delta_s > 0 and delta_cpu >= 0:
             cpu.append(delta_cpu / (delta_s * 1_000_000))
     memory = [row[2] / 1024 / 1024 for row in rows]
-    return {
+    result = {
         "samples": len(rows),
         "cpu_peak_cores": max(cpu) if cpu else None,
         "cpu_mean_cores": statistics.mean(cpu) if cpu else None,
         "memory_peak_mib": max(memory),
         "memory_mean_mib": statistics.mean(memory),
     }
+    for name, values in extra.items():
+        result[f"memory_{name}_peak_mib"] = max(values) if values else None
+        result[f"memory_{name}_mean_mib"] = statistics.mean(values) if values else None
+    return result
 
 
 def _raw_trace_parts(trace: Path, agent: str) -> list[dict[str, Any]]:
@@ -436,11 +461,30 @@ def _normalized_efficiency(trace: Path) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for index, row in enumerate(raw_rows):
         previous = raw_rows[index - 1] if index > 0 else {}
-        context = float(row.get("prompt_boundary_ms") or row.get("context_assembly_window_ms") or 0.0)
-        response = float(previous.get("response_processing_full_ms") or 0.0) if index > 0 else 0.0
-        dispatch = float(previous.get("tool_dispatch_overhead_ms") or 0.0) if index > 0 else 0.0
-        sandbox_exec = float(previous.get("exec_ms") or 0.0) if index > 0 else 0.0
-        tool_failure = float(previous.get("tool_failure_ms") or 0.0) if index > 0 else 0.0
+        raw_boundary = float(row.get("prompt_boundary_ms") or 0.0)
+        response = float(
+            row["response_processing_bucket_ms"] if row.get("response_processing_bucket_ms") is not None
+            else (previous.get("response_processing_ms") or 0.0) if index > 0 else 0.0
+        )
+        dispatch = float(row.get("tool_dispatch_overhead_bucket_ms") or 0.0)
+        sandbox_exec = float(
+            row["sandbox_execution_bucket_ms"] if row.get("sandbox_execution_bucket_ms") is not None
+            else (previous.get("exec_ms") or 0.0) if index > 0 else 0.0
+        )
+        tool_failure = float(
+            row["tool_failure_bucket_ms"] if row.get("tool_failure_bucket_ms") is not None
+            else (previous.get("tool_failure_ms") or 0.0) if index > 0 else 0.0
+        )
+        if row.get("context_assembly_bucket_ms") is not None:
+            context = float(row["context_assembly_bucket_ms"])
+        elif index == 0:
+            context = raw_boundary
+        elif row.get("context_assembly_window_ms") is not None:
+            context = float(row["context_assembly_window_ms"])
+        else:
+            # Legacy rows can provide only the inclusive prompt boundary.
+            # The measured response/tool intervals already occupy that gap.
+            context = max(0.0, raw_boundary - response - dispatch - sandbox_exec - tool_failure)
         raw_sandbox_init = float(
             row.get("pre_model_sandbox_access_ms") or row.get("sandbox_init_ms") or 0.0
         )
@@ -463,6 +507,7 @@ def _normalized_efficiency(trace: Path) -> list[dict[str, Any]]:
             "sandbox_init_ms": sandbox_init,
             "sandbox_reuse_ms": sandbox_reuse,
             "prompt_boundary_ms": context,
+            "raw_prompt_boundary_ms": raw_boundary,
             "response_processing_ms": response,
             "response_processing_raw_ms": float(row.get("response_processing_full_ms") or 0.0),
             "tool_dispatch_overhead_ms": dispatch,
@@ -1365,6 +1410,12 @@ def summarize_trace(trace: Path) -> dict[str, Any]:
     lifecycle = load(shell / "sandbox_lifecycle.json", {})
     metadata = load(trace / "trace.json", {})
     driver_summary = load(shell / "summary.json", {})
+    measured_start = driver_summary.get("start_unix")
+    measured_end = driver_summary.get("end_unix")
+    try:
+        measured_window = {"start_unix": float(measured_start), "end_unix": float(measured_end)}
+    except (TypeError, ValueError):
+        measured_window = {}
     appworld_events_path = trace / "data/appworld/events.jsonl"
     generic_backend_events_path = trace / "data/backend/events.jsonl"
     if appworld_events_path.exists():
@@ -1388,9 +1439,9 @@ def summarize_trace(trace: Path) -> dict[str, Any]:
                 continue
     prom = shell / "prometheus"
     cgroup = prom / "cgroup"
-    cgroup_openclaw = cgroup_stats(cgroup / "openclaw_gateway.csv")
-    cgroup_sandbox = cgroup_stats(cgroup / "openshell_sandbox.csv")
-    cgroup_openshell_gw = cgroup_stats(cgroup / "openshell_gateway.csv")
+    cgroup_openclaw = cgroup_stats(cgroup / "openclaw_gateway.csv", **measured_window)
+    cgroup_sandbox = cgroup_stats(cgroup / "openshell_sandbox.csv", **measured_window)
+    cgroup_openshell_gw = cgroup_stats(cgroup / "openshell_gateway.csv", **measured_window)
     diagrams = shell / "profile-v2/diagrams"
     lifecycle_reuse_raw = lifecycle.get("sandbox_reuse_ms")
     lifecycle_reuse_measurement = str(
@@ -1420,10 +1471,21 @@ def summarize_trace(trace: Path) -> dict[str, Any]:
     agent = agent.split(".trace-replay.svc.cluster.local", 1)[0]
     session = str(metadata.get("session_id") or driver_summary.get("session_id") or trace.name.split("__", 1)[0].split("-", 1)[-1])
     workload = trace.name.split("__", 1)[1] if "__" in trace.name else "unknown"
+    backend_fidelity = {
+        "software_engineering_qa": "staged_source_checkout_not_task_image_dependencies",
+        "personal_assistant": "stateful_appworld_api",
+        "research_deep_search": "generated_local_response_size_matched_where_available",
+        "customer_support_ops": "generated_local_response_size_matched_where_available",
+    }.get(workload, "unknown")
     return {
+        "attempt_number": int(metadata.get("attempt_number") or 1),
+        "benchmark_eligible": metadata.get("benchmark_eligible", True) is True,
+        "measured_start_unix": driver_summary.get("start_unix"),
+        "measured_end_unix": driver_summary.get("end_unix"),
         "trace": trace.name,
         "session_id": session,
         "workload": workload,
+        "backend_fidelity": backend_fidelity,
         "agent": agent,
         "turns": len(timing),
         "tool_calls": len(tools),
@@ -1472,12 +1534,19 @@ def summarize_trace(trace: Path) -> dict[str, Any]:
         "cgroup_openclaw_cpu_mean_cores": cgroup_openclaw["cpu_mean_cores"],
         "cgroup_openclaw_memory_peak_mib": cgroup_openclaw["memory_peak_mib"],
         "cgroup_openclaw_memory_mean_mib": cgroup_openclaw["memory_mean_mib"],
+        "cgroup_openclaw_working_set_peak_mib": cgroup_openclaw.get("memory_working_set_peak_mib"),
+        "cgroup_openclaw_anon_peak_mib": cgroup_openclaw.get("memory_anon_peak_mib"),
+        "cgroup_openclaw_inactive_file_peak_mib": cgroup_openclaw.get("memory_inactive_file_peak_mib"),
         "cgroup_openshell_sandbox_cpu_peak_cores": cgroup_sandbox["cpu_peak_cores"],
         "cgroup_openshell_sandbox_cpu_mean_cores": cgroup_sandbox["cpu_mean_cores"],
         "cgroup_openshell_sandbox_memory_peak_mib": cgroup_sandbox["memory_peak_mib"],
+        "cgroup_openshell_sandbox_working_set_peak_mib": cgroup_sandbox.get("memory_working_set_peak_mib"),
+        "cgroup_openshell_sandbox_anon_peak_mib": cgroup_sandbox.get("memory_anon_peak_mib"),
+        "cgroup_openshell_sandbox_inactive_file_peak_mib": cgroup_sandbox.get("memory_inactive_file_peak_mib"),
         "cgroup_openshell_gateway_cpu_peak_cores": cgroup_openshell_gw["cpu_peak_cores"],
         "cgroup_openshell_gateway_cpu_mean_cores": cgroup_openshell_gw["cpu_mean_cores"],
         "cgroup_openshell_gateway_memory_peak_mib": cgroup_openshell_gw["memory_peak_mib"],
+        "cgroup_openshell_gateway_working_set_peak_mib": cgroup_openshell_gw.get("memory_working_set_peak_mib"),
         "cgroup_openshell_sandbox_memory_mean_mib": cgroup_sandbox["memory_mean_mib"],
         "cgroup_openclaw_samples": cgroup_openclaw["samples"],
         "cgroup_openshell_sandbox_samples": cgroup_sandbox["samples"],
@@ -1500,6 +1569,8 @@ def write_quality_gate(rows: list[dict[str, Any]], out: Path) -> None:
         # not applicable and are excluded from tool-stage aggregates. Their
         # lifecycle, plots, and functional conformance must still pass.
         conversational = bool(row.get("conversational_trace"))
+        if row.get("benchmark_eligible") is False:
+            reasons.append("successful diagnostic retry is excluded from benchmark scoring")
         if not conversational and int(row.get("successful_tool_calls") or 0) <= 0:
             reasons.append("no successful tool call")
         if not conversational and int(row.get("backend_event_count") or 0) <= 0:
@@ -1611,66 +1682,48 @@ def plot_groups(rows: list[dict[str, Any]], out: Path) -> None:
     )
     openclaw_cpu = [mean_present(by_agent[a], "cgroup_openclaw_cpu_peak_cores") for a in agents]
     sandbox_cpu = [mean_present(by_agent[a], "cgroup_openshell_sandbox_cpu_peak_cores") for a in agents]
-    gateway_cpu = [mean_present(by_agent[a], "cgroup_openshell_gateway_cpu_peak_cores") or mean_present(by_agent[a], "openshell_cpu_peak_cores") for a in agents]
     axes[0].barh(
-        x,
+        [index - 0.19 for index in x],
         openclaw_cpu,
         label="OpenClaw cgroup",
         color=palette["openclaw"],
         edgecolor="white",
         linewidth=0.5,
+        height=0.36,
     )
     axes[0].barh(
-        x,
-        gateway_cpu,
-        left=openclaw_cpu,
-        label="OpenShell gateway",
-        color=palette["gateway"],
-        edgecolor="white",
-        linewidth=0.5,
-    )
-    axes[0].barh(
-        x,
+        [index + 0.19 for index in x],
         sandbox_cpu,
-        left=[a + b for a, b in zip(openclaw_cpu, gateway_cpu)],
         label="OpenShell sandbox",
         color=palette["sandbox"],
         edgecolor="white",
         linewidth=0.5,
+        height=0.36,
     )
     axes[0].set_yticks(x, agent_labels)
     axes[0].invert_yaxis()
     axes[0].set_xlabel("Peak CPU cores")
-    openclaw_memory = [mean_present(by_agent[a], "cgroup_openclaw_memory_peak_mib") for a in agents]
-    sandbox_memory = [mean_present(by_agent[a], "cgroup_openshell_sandbox_memory_peak_mib") for a in agents]
-    gateway_memory = [mean_present(by_agent[a], "cgroup_openshell_gateway_memory_peak_mib") or mean_present(by_agent[a], "openshell_memory_peak_mib") for a in agents]
+    openclaw_memory = [mean_present(by_agent[a], "cgroup_openclaw_working_set_peak_mib") for a in agents]
+    sandbox_memory = [mean_present(by_agent[a], "cgroup_openshell_sandbox_working_set_peak_mib") for a in agents]
     axes[1].barh(
-        x,
+        [index - 0.19 for index in x],
         openclaw_memory,
         label="OpenClaw cgroup",
         color=palette["openclaw"],
         edgecolor="white",
         linewidth=0.5,
+        height=0.36,
     )
     axes[1].barh(
-        x,
-        gateway_memory,
-        left=openclaw_memory,
-        label="OpenShell gateway",
-        color=palette["gateway"],
-        edgecolor="white",
-        linewidth=0.5,
-    )
-    axes[1].barh(
-        x,
+        [index + 0.19 for index in x],
         sandbox_memory,
-        left=[a + b for a, b in zip(openclaw_memory, gateway_memory)],
         label="OpenShell sandbox",
         color=palette["sandbox"],
         edgecolor="white",
         linewidth=0.5,
+        height=0.36,
     )
-    axes[1].set_xlabel("Peak memory MiB")
+    axes[1].set_xlabel("Peak memory working set MiB")
     for axis in axes:
         axis.set_facecolor("#FFFFFF")
         axis.grid(axis="x", color="#CBD5E1", alpha=0.45, linewidth=0.8)
@@ -1682,10 +1735,11 @@ def plot_groups(rows: list[dict[str, Any]], out: Path) -> None:
         axis.spines["left"].set_color("#CBD5E1")
         axis.spines["bottom"].set_color("#CBD5E1")
     axes[0].set_title("Peak CPU", loc="left", fontsize=13, fontweight="bold", color="#0F172A", pad=10)
-    axes[1].set_title("Peak memory", loc="left", fontsize=13, fontweight="bold", color="#0F172A", pad=10)
+    axes[1].set_title("Peak memory working set", loc="left", fontsize=13, fontweight="bold", color="#0F172A", pad=10)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.suptitle("Cross-agent resource peaks", fontsize=18, fontweight="bold", color="#0F172A", y=0.995)
-    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.5, 0.955), fontsize=9)
+    fig.suptitle("Per-agent component resource peaks", fontsize=18, fontweight="bold", color="#0F172A", y=0.995)
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 0.955), fontsize=9)
+    fig.text(0.30, 0.025, "Component peaks are not simultaneous or additive. The shared OpenShell gateway is excluded from per-agent bars.", fontsize=8.5, color="#475569")
     fig.subplots_adjust(left=0.30, right=0.98, top=0.86, bottom=0.06, wspace=0.18)
     fig.savefig(out / "cross_agent_resources.png", dpi=160)
     plt.close(fig)
@@ -1803,6 +1857,53 @@ def plot_groups(rows: list[dict[str, Any]], out: Path) -> None:
     plot_parallel_timing(trace_paths, out, rows)
 
 
+def write_concurrency_timeline(rows: list[dict[str, Any]], out: Path) -> dict[str, Any]:
+    """Measure session overlap from driver windows, not requested workers."""
+    events: list[tuple[float, int, str]] = []
+    missing: list[str] = []
+    for row in rows:
+        try:
+            start = float(row["measured_start_unix"])
+            end = float(row["measured_end_unix"])
+        except (KeyError, TypeError, ValueError):
+            missing.append(str(row.get("trace") or ""))
+            continue
+        if end <= start:
+            missing.append(str(row.get("trace") or ""))
+            continue
+        trace = str(row.get("trace") or "")
+        events.extend(((start, 1, trace), (end, -1, trace)))
+    events.sort(key=lambda event: (event[0], event[1]))
+    intervals: list[dict[str, Any]] = []
+    active = 0
+    previous_time: float | None = None
+    for timestamp, change, trace in events:
+        if previous_time is not None and timestamp > previous_time:
+            intervals.append({
+                "start_unix": previous_time, "end_unix": timestamp,
+                "duration_s": timestamp - previous_time, "active_sessions": active,
+            })
+        active += change
+        previous_time = timestamp
+    wall_s = sum(interval["duration_s"] for interval in intervals)
+    weighted_s = sum(interval["duration_s"] * interval["active_sessions"] for interval in intervals)
+    summary = {
+        "schema": "agentic.trace-replay.observed-concurrency.v1",
+        "measured_sessions": len(events) // 2,
+        "missing_session_windows": missing,
+        "peak_active_sessions": max((interval["active_sessions"] for interval in intervals), default=0),
+        "mean_active_sessions": weighted_s / wall_s if wall_s else 0.0,
+        "wall_window_s": wall_s,
+        "source": "driver summary start_unix/end_unix; excludes preparation and collection",
+    }
+    (out / "observed_concurrency.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    with (out / "observed_concurrency.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("start_unix", "end_unix", "duration_s", "active_sessions"))
+        writer.writeheader()
+        writer.writerows(intervals)
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment", type=Path, required=True)
@@ -1812,6 +1913,15 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     (out / "cross_agent_summary.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
     write_quality_gate(rows, out)
+    write_concurrency_timeline(rows, out)
+    shared_gateway_path = args.experiment / "shared_openshell_gateway_cgroup.csv"
+    if shared_gateway_path.exists():
+        shared_gateway = cgroup_stats(shared_gateway_path)
+        shared_gateway["scope"] = "one shared OpenShell gateway for the whole experiment"
+        shared_gateway["sampler_self_cost"] = "included; platform baseline not yet calibrated"
+        (out / "shared_gateway_resource_summary.json").write_text(
+            json.dumps(shared_gateway, indent=2) + "\n", encoding="utf-8"
+        )
     if rows:
         with (out / "cross_agent_summary.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))

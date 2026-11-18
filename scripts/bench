@@ -71,9 +71,10 @@ SESSION_IDS=""
 QUICK=false
 OUT_DIR=""
 DISPATCH_INTERVAL=2
-RETRIES=2
+RETRIES=0
 SIMULATED_TTFT=""
 SIMULATED_ITL=""
+CLIENT_GAP_MS=0
 CORPUS="${CORPUS:-data/replay.json}"
 WARM_POOL=""       # default: same as --agents
 COLD_RATIO=""      # e.g. 0.2 means 20% of agents use cold-start
@@ -107,6 +108,7 @@ while [[ $# -gt 0 ]]; do
         --retries)           RETRIES="$2"; shift 2 ;;
         --simulated-ttft)    SIMULATED_TTFT="$2"; shift 2 ;;
         --simulated-itl)     SIMULATED_ITL="$2"; shift 2 ;;
+        --client-gap-ms)     CLIENT_GAP_MS="$2"; shift 2 ;;
         --ttft-simulated)    SIMULATED_TTFT="$2"; shift 2 ;;
         --itl-simulated)     SIMULATED_ITL="$2"; shift 2 ;;
         --warm-pool)         WARM_POOL="$2"; shift 2 ;;
@@ -126,7 +128,8 @@ USAGE
   bench --agents N [options]
 
 REQUIRED
-  --agents N, -a N          Number of concurrent agents (e.g. 4, 8, 100)
+  --agents N, -a N          Number of deployed agent slots (e.g. 4, 8, 100);
+                             observed overlap is reported after the run
 
 WORKLOAD DISTRIBUTION
   --workload-dist DIST, -w DIST
@@ -145,8 +148,8 @@ WORKLOAD DISTRIBUTION
        Full names also accepted: software_engineering_qa, etc.
 
 TRACE SELECTION
-  --traces N, -t N          Traces per workload (default: 1 for small runs,
-                             auto-computed from corpus for large runs)
+  --traces N, -t N          Minimum distinct tool-calling trajectories available
+                             per selected workload (default: the required count)
   --session-ids IDS         Comma-separated session IDs (overrides --traces)
 
 CLUSTER
@@ -155,7 +158,10 @@ CLUSTER
 
 EXECUTION
   --dispatch-interval SEC   Seconds between trace admissions (default: 2)
-  --retries N               Retry count for failed traces (default: 2)
+  --client-gap-ms MS        Controlled pause between recorded client messages
+                             (default: 0; no human think time)
+  --retries N               Diagnostic retry count (default: 0; retried traces
+                            are excluded from benchmark scoring)
   --simulated-ttft MS       Simulated time-to-first-token in ms
                              (overrides recorded timing; e.g. 50 = 50ms TTFT)
   --ttft-simulated MS       Alias for --simulated-ttft
@@ -300,34 +306,10 @@ case "$WORKLOAD_DIST" in
         ;;
     *)
         # Custom distribution: swe=2,pa=1,... or swe:50,pa:30,...
-        IFS=',' read -ra PARTS <<< "$WORKLOAD_DIST"
-        TOTAL=0
-        IS_PERCENT=false
-        for part in "${PARTS[@]}"; do
-            if [[ "$part" == *:* ]]; then
-                IS_PERCENT=true
-                key="${part%%:*}"; val="${part##*:}"
-            else
-                key="${part%%=*}"; val="${part##*=}"
-            fi
-            [[ -n "${WL_BENCH[$key]:-}" ]] || { echo "Error: unknown workload '$key'"; exit 1; }
-            WL_COUNT[$key]=$val
-            TOTAL=$((TOTAL + val))
-        done
-        # Fill unspecified workloads with 0
-        for k in swe pa research cs; do
-            [[ -z "${WL_COUNT[$k]:-}" ]] && WL_COUNT[$k]=0
-        done
-        if $IS_PERCENT; then
-            # Convert percentages to agent counts
-            for k in swe pa research cs; do
-                if [[ -n "${WL_COUNT[$k]:-}" && "${WL_COUNT[$k]}" -gt 0 ]]; then
-                    WL_COUNT[$k]=$((AGENTS * WL_COUNT[$k] / 100))
-                fi
-            done
-        elif [[ $TOTAL -ne $AGENTS ]]; then
-            echo "Warning: workload counts ($TOTAL) != agent count ($AGENTS)"
-        fi
+        COUNTS=$(PYTHONPATH=src python3 -m trace_replay_sim.workload_allocation "$AGENTS" "$WORKLOAD_DIST") || exit 1
+        IFS=',' read -r SWE_N PA_N RESEARCH_N CS_N <<< "$COUNTS"
+        WL_COUNT[swe]=$SWE_N; WL_COUNT[pa]=$PA_N
+        WL_COUNT[research]=$RESEARCH_N; WL_COUNT[cs]=$CS_N
         ;;
 esac
 
@@ -337,33 +319,46 @@ for k in swe pa research cs; do
     TOTAL_TRACES=$((TOTAL_TRACES + WL_COUNT[$k]))
 done
 
-if [[ -z "$TRACES_PER_WORKLOAD" ]]; then
-    TRACES_PER_WORKLOAD=1
-    # For large runs, auto-scale
-    if [[ $AGENTS -gt 20 ]]; then
-        TRACES_PER_WORKLOAD=$((AGENTS / 4))
-    fi
+if [[ -n "$TRACES_PER_WORKLOAD" ]]; then
+    [[ "$TRACES_PER_WORKLOAD" =~ ^[1-9][0-9]*$ ]] || { echo "Error: --traces must be a positive integer" >&2; exit 1; }
 fi
 
 # Auto-select sessions
 if [[ -z "$SESSION_IDS" ]]; then
-    SESSION_IDS=$(python3 -c "
+    SESSION_IDS=$(PYTHONPATH=src python3 - "$CORPUS" "${WL_COUNT[swe]}" "${WL_COUNT[pa]}" "${WL_COUNT[research]}" "${WL_COUNT[cs]}" "$TRACES_PER_WORKLOAD" <<'PY'
 import json
-c = json.load(open('$CORPUS'))
-by_wl = {}
-for s in c['sessions']:
-    by_wl.setdefault(s['workload'], []).append(s)
+import sys
+from trace_replay_sim.workloads import WORKLOADS, select_tool_rich_sessions
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    corpus = json.load(handle)
+counts = dict(zip(WORKLOADS, map(int, sys.argv[2:])))
 picks = []
-counts = {'software_engineering_qa': ${WL_COUNT[swe]}, 'personal_assistant': ${WL_COUNT[pa]}, 'research_deep_search': ${WL_COUNT[research]}, 'customer_support_ops': ${WL_COUNT[cs]}}
-for wl, n in counts.items():
-    pool = by_wl.get(wl, [])
-    # Prefer tool-rich sessions (avoid conversational for backend mapping)
-    tool_rich = sorted([s for s in pool if s['tool_call_count'] > 0], key=lambda s: s['session_id'])
-    conversational = sorted([s for s in pool if s['tool_call_count'] == 0], key=lambda s: s['session_id'])
-    selected = (tool_rich + conversational)[:n]
-    picks.extend(s['session_id'] for s in selected)
-print(','.join(picks))
-")
+for workload, count in counts.items():
+    if not count:
+        continue
+    available = [
+        session for session in corpus["sessions"]
+        if session.get("workload") == workload
+        and any(turn.get("tool_calls") for turn in session.get("turns") or [])
+    ]
+    minimum = max(count, int(sys.argv[6] or 0))
+    if len(available) < minimum:
+        raise SystemExit(
+            f"Error: {workload} requires --traces={minimum} distinct tool-calling trajectories; found {len(available)}"
+        )
+    selected = select_tool_rich_sessions(
+        available,
+        count,
+    )
+    if len(selected) != count:
+        raise SystemExit(
+            f"Error: {workload} needs {count} distinct tool-calling trajectories; found {len(selected)}"
+        )
+    picks.extend(str(session["session_id"]) for session in selected)
+print(",".join(picks))
+PY
+    )
 fi
 
 # Warm pool / cold ratio
@@ -401,7 +396,7 @@ box_detail "SWE (swebench)" "${WL_COUNT[swe]:-0}"
 box_detail "PA (AppWorld)" "${WL_COUNT[pa]:-0}"
 box_detail "Research (BrowseComp+)" "${WL_COUNT[research]:-0}"
 box_detail "CS (Tau2)" "${WL_COUNT[cs]:-0}"
-box_field "Concurrent workers" "$AGENTS"
+box_field "Agent slots" "$AGENTS"
 if (( WARM_POOL == 1 )); then
     box_field "Warm pool" "1 sandbox"
 else
@@ -416,11 +411,12 @@ if [[ -n "$COLD_RATIO" ]]; then
     fi
 fi
 box_field "Dispatch" "${DISPATCH_INTERVAL}s between admissions"
+box_field "Client gap" "${CLIENT_GAP_MS}ms between recorded client messages"
 box_field "Retries" "$RETRIES per trace"
 if [[ -n "$SIMULATED_TTFT" || -n "$SIMULATED_ITL" ]]; then
-    box_field "Model timing" "ttft=${SIMULATED_TTFT:-recorded}ms itl=${SIMULATED_ITL:-recorded}ms (simulated)"
+    box_field "Model timing" "ttft=${SIMULATED_TTFT:-0}ms itl=${SIMULATED_ITL:-0}ms (simulated)"
 else
-    box_field "Model timing" "recorded trace timing"
+    box_field "Model timing" "humaneval-vllm-c1 profile + context prefill"
 fi
 box_field "Replay mode" "client-boundary (one request per user message)"
 box_field "LLM" "mock sidecar (deterministic)"
@@ -486,6 +482,14 @@ elif [[ -n "$STORAGE_CLASS" ]]; then
     WORKSPACE_ARGS+=(--workspace-access-mode ReadWriteOnce --workspace-storage-class "$STORAGE_CLASS")
 fi
 
+MODEL_TIMING_ARGS=()
+if [[ -n "$SIMULATED_TTFT" ]]; then
+    MODEL_TIMING_ARGS+=(--simulated-ttft "$SIMULATED_TTFT")
+fi
+if [[ -n "$SIMULATED_ITL" ]]; then
+    MODEL_TIMING_ARGS+=(--simulated-itl "$SIMULATED_ITL")
+fi
+
 # Run
 START_EPOCH=$(date +%s)
 echo "  ▶ Starting at $(date '+%H:%M:%S') — streaming phases below"
@@ -511,8 +515,8 @@ python3 scripts/run_experiment.py \
     --warm-pool-size "$WARM_POOL" \
     --execution-workers "$AGENTS" \
     --job-dispatch-interval "$DISPATCH_INTERVAL" \
-    ${SIMULATED_TTFT:+--simulated-ttft "$SIMULATED_TTFT"} \
-    ${SIMULATED_ITL:+--simulated-itl "$SIMULATED_ITL"} \
+    --client-gap-ms "$CLIENT_GAP_MS" \
+    ${MODEL_TIMING_ARGS[@]+"${MODEL_TIMING_ARGS[@]}"} \
     $EXTRA \
     2>&1 | tee "$OUT_DIR/controller.log" \
          | grep --line-buffered -E '^\[|^preflight:|trace (complete|failed):|sandbox pool:|quality gate|Benchmark (complete|failed)' \

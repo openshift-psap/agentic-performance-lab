@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -106,11 +107,30 @@ def _expected_tools(session: dict[str, Any]) -> list[dict[str, Any]]:
     for turn in session.get("turns") or []:
         turn_index = int(turn.get("index") or 0)
         for call_index, call in enumerate(turn.get("tool_calls") or []):
+            recorded_result = call.get("recorded_result")
+            try:
+                parsed_result = json.loads(recorded_result) if isinstance(recorded_result, str) else recorded_result
+            except (TypeError, ValueError):
+                parsed_result = None
+            expected_returncode = (
+                int(parsed_result["returncode"])
+                if isinstance(parsed_result, dict) and parsed_result.get("returncode") is not None
+                else None
+            )
+            recorded_output = (
+                str(parsed_result.get("output") or "")
+                if isinstance(parsed_result, dict) else str(recorded_result or "")
+            )
             calls.append({
                 "turn": turn_index,
                 "call": call_index,
                 "name": str(call.get("name") or ""),
                 "arguments_sha256": arguments_sha256(call.get("arguments") or {}),
+                "expected_returncode": expected_returncode,
+                "recorded_dependency_failure": bool(re.search(
+                    r"ModuleNotFoundError|No module named\s+\S+|ImportError:",
+                    recorded_output, re.IGNORECASE,
+                )),
             })
     return calls
 
@@ -282,7 +302,42 @@ def verify_trace(
                 and observed_commits == [expected_commit],
                 expected={"execution_mode": "sandbox", "base_commit": expected_commit},
                 observed={"execution_modes": observed_modes, "sandbox_base_commits": observed_commits},
-                details="every SWE tool call ran in the pinned OpenShell task-image repository",
+                details="every SWE tool call reached the staged source repository through OpenShell; dependency fidelity is checked separately",
+            ))
+            expected_codes = {
+                (int(call["turn"]), int(call["call"])): call["expected_returncode"]
+                for call in expected_backend if call.get("expected_returncode") is not None
+            }
+            if expected_codes:
+                observed_codes = {
+                    (int(event["turn"]), int(event["call"])): int(event["sandbox_returncode"])
+                    for event in observed_backend
+                    if event.get("turn") is not None and event.get("call") is not None
+                    and event.get("sandbox_returncode") is not None
+                    and (int(event["turn"]), int(event["call"])) in expected_codes
+                }
+                checks.append(_check(
+                    "swe_recorded_exit_codes",
+                    observed_codes == expected_codes,
+                    expected=expected_codes,
+                    observed=observed_codes,
+                    details="recorded command exit codes agree with sandbox execution",
+                ))
+            unexpected_dependency_failures = [
+                (int(event["turn"]), int(event["call"]))
+                for event in observed_backend
+                if event.get("turn") is not None and event.get("call") is not None
+                and event.get("sandbox_dependency_failure")
+                and not next((call["recorded_dependency_failure"] for call in expected_backend
+                              if (int(call["turn"]), int(call["call"]))
+                              == (int(event["turn"]), int(event["call"]))), False)
+            ]
+            checks.append(_check(
+                "swe_dependency_failures",
+                not unexpected_dependency_failures,
+                expected="no new import or missing-module errors relative to the recording",
+                observed=unexpected_dependency_failures,
+                details="a staged checkout alone does not guarantee the recorded task dependencies",
             ))
         actual_pairs = [(event.get("turn"), event.get("call")) for event in observed_backend]
         expected_pairs = [(call["turn"], call["call"]) for call in expected_backend]

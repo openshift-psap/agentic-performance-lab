@@ -1,5 +1,7 @@
 import json
 import base64
+import csv
+import hashlib
 import re
 from collections import Counter
 from pathlib import Path
@@ -11,6 +13,16 @@ import sys
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
 import run_experiment as experiment
+
+
+def test_node_assignment_balances_each_workload_without_changing_safe_slots():
+    queue = [{"workload": workload} for _ in range(10) for workload in WORKLOADS]
+    slots = ["node-a", "node-b"] * 20
+    assigned = experiment._balance_workloads_across_nodes(queue, slots)
+    assert Counter(assigned) == Counter(slots)
+    for workload in WORKLOADS:
+        counts = Counter(node for item, node in zip(queue, assigned) if item["workload"] == workload)
+        assert abs(counts["node-a"] - counts["node-b"]) <= 1
 
 from run_experiment import (
     _install_pinned_openshell_wrapper,
@@ -92,6 +104,9 @@ def test_100_agent_four_workload_plan_is_complete_without_cluster(tmp_path):
     queue = build_queue(corpus, tmp_path / "initial", allocation)
     assert len(queue) == 100
     assert Counter(item["workload"] for item in queue) == Counter(allocation)
+    audit = json.loads((tmp_path / "initial" / "selected_trajectory_audit.json").read_text())
+    assert audit["selected_sessions"] == 100
+    assert len(audit["sessions"]) == 100
 
     mapped = prepare_workload_corpus(
         corpus,
@@ -104,6 +119,16 @@ def test_100_agent_four_workload_plan_is_complete_without_cluster(tmp_path):
     assert len(mapped_queue) == 100
     assert Counter(item["workload"] for item in mapped_queue) == Counter(allocation)
     assert all(item["session"].get("swe_task") for item in mapped_queue if item["workload"] == "software_engineering_qa")
+    swe_item = next(item for item in mapped_queue if item["workload"] == "software_engineering_qa")
+    swe_session = swe_item["session"]
+    swe_command = swe_session["turns"][0]["tool_calls"][0]["mapped_command"]
+    assert swe_command == ["python3", "/tmp/trace-replay-tool-calls/0000-000.py"]
+    script_dir = tmp_path / "swe-tool-scripts" / hashlib.sha256(
+        swe_session["session_id"].encode()
+    ).hexdigest()[:16]
+    script = script_dir / "0000-000.py"
+    assert script.exists()
+    compile(script.read_text(encoding="utf-8"), str(script), "exec")
     assert all(
         tool.get("mapped_command")
         for item in mapped_queue
@@ -227,6 +252,37 @@ def test_sandbox_cgroup_merge_enforces_expected_quota(tmp_path):
     sample.unlink()
     with pytest.raises(RuntimeError):
         experiment._merge_sandbox_cgroup_samples(tmp_path, "50000 100000")
+
+
+def test_sandbox_cgroup_merge_sums_rates_without_cross_pod_spikes(tmp_path):
+    raw = tmp_path / "sandbox_samples"
+    raw.mkdir()
+    header = ",".join(experiment.CGROUP_SAMPLE_COLUMNS)
+
+    def write_source(name, samples):
+        rows = []
+        for timestamp, cpu in samples:
+            row = {column: "0" for column in experiment.CGROUP_SAMPLE_COLUMNS}
+            row.update({"epoch_ns": str(timestamp), "cpu_usage_usec": str(cpu),
+                        "memory_bytes": "100", "cpu_quota": "50000", "cpu_period": "100000"})
+            rows.append(",".join(row[column] for column in experiment.CGROUP_SAMPLE_COLUMNS))
+        (raw / name).write_text(header + "\n" + "\n".join(rows) + "\n", encoding="utf-8")
+
+    write_source("a.csv", [(1_000_000_000, 100_000), (2_000_000_000, 600_000)])
+    write_source("b.csv", [(1_050_000_000, 10_000), (2_050_000_000, 510_000)])
+
+    experiment._merge_sandbox_cgroup_samples(tmp_path, "50000 100000")
+    with (tmp_path / "openshell_sandbox.csv").open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    rates = [
+        (int(right["cpu_usage_usec"]) - int(left["cpu_usage_usec"]))
+        / ((int(right["epoch_ns"]) - int(left["epoch_ns"])) / 1000)
+        for left, right in zip(rows, rows[1:])
+    ]
+    assert len(rows) == 4
+    assert max(rates) <= 1.01
+    assert max(rates) >= 0.99
+    assert int(rows[-1]["cpu_usage_usec"]) == 1_000_000
 
 
 def test_tool_cgroup_quota_maps_to_kubernetes_cpu_quantity():

@@ -1,7 +1,27 @@
 import json
+from io import BytesIO
 
 from trace_replay_sim import driver
 from trace_replay_sim.driver import RequestResult, drive_client_turns
+
+
+def test_driver_ttft_uses_first_streamed_token_and_request_start(monkeypatch):
+    stream = BytesIO(
+        b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":"second"}}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    timestamps = iter((1_100_000_000, 1_900_000_000))
+    monkeypatch.setattr(driver.time, "perf_counter_ns", lambda: next(timestamps))
+
+    ttft_ms, first_ns, events, _, phases = driver._read_sse_edges(
+        stream, t_send_ns=1_000_000_000
+    )
+
+    assert ttft_ms == 100.0
+    assert first_ns == 1_100_000_000
+    assert events == 2
+    assert phases["last_event_ns"] == 1_900_000_000
 
 
 def _result(**overrides):

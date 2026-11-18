@@ -11,7 +11,7 @@ import os
 import re
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -47,8 +47,9 @@ class AppWorldAdapter:
 
         self.AppWorld = AppWorld
         self.mapping = json.loads(Path(mapping_path).read_text(encoding="utf-8"))
-        self.worlds: dict[str, object] = {}
-        self.tokens: dict[str, dict[str, str]] = {}
+        self.worlds: dict[tuple[str, str], object] = {}
+        self.tokens: dict[tuple[str, str], dict[str, str]] = {}
+        self.world_locks: dict[tuple[str, str], threading.Lock] = {}
         # Keep a bounded-in-practice, read-only audit stream for the
         # experiment controller.  The controller filters this by session ID
         # after each trace; no benchmark state is changed by the read path.
@@ -59,11 +60,13 @@ class AppWorldAdapter:
     def _clock_ns() -> int:
         return time.clock_gettime_ns(getattr(time, "CLOCK_MONOTONIC_RAW", time.CLOCK_MONOTONIC))
 
-    def _world(self, session_id: str, task_id: str):
-        world = self.worlds.get(session_id)
+    def _world(self, key: tuple[str, str], task_id: str):
+        world = self.worlds.get(key)
         if world is None:
-            world = self.AppWorld(task_id=task_id, experiment_name="trace-replay")
-            self.worlds[session_id] = world
+            run_key, _ = key
+            experiment_name = f"trace-replay-{run_key[:12]}" if run_key else "trace-replay"
+            world = self.AppWorld(task_id=task_id, experiment_name=experiment_name)
+            self.worlds[key] = world
         return world
 
     @staticmethod
@@ -80,14 +83,14 @@ class AppWorldAdapter:
                         return str(account.get("password") or "")
         return None
 
-    def _translate_arguments(self, session_id: str, world, app_name: str, api_name: str, arguments: dict) -> dict:
+    def _translate_arguments(self, key: tuple[str, str], world, app_name: str, api_name: str, arguments: dict) -> dict:
         translated = json.loads(json.dumps(arguments))
         if api_name == "login":
             translated["username"] = world.task.supervisor.get("email")
             password = self._account_password(world, app_name)
             if password:
                 translated["password"] = password
-        token = self.tokens.get(session_id, {}).get(app_name)
+        token = self.tokens.get(key, {}).get(app_name)
         if token:
             for key in ("access_token", "token"):
                 if key in translated:
@@ -96,6 +99,10 @@ class AppWorldAdapter:
 
     def execute(self, request: dict) -> dict:
         session_id = str(request.get("session_id") or "")
+        run_key = str(request.get("run_key") or "")
+        if run_key and not re.fullmatch(r"[0-9a-f]{32}", run_key):
+            return {"ok": False, "error": "invalid replay run key"}
+        state_key = (run_key, session_id)
         task_id = self.mapping.get(session_id)
         def reject(error: str) -> dict:
             print(json.dumps({
@@ -124,11 +131,14 @@ class AppWorldAdapter:
                 return reject(f"invalid AppWorld tool component: {name}")
             expression = f"response = apis.{app_name}.{api_name}(**arguments)"
 
-        started_ns = self._clock_ns()
+        queued_ns = self._clock_ns()
         with self.lock:
-            world = self._world(session_id, task_id)
+            world_lock = self.world_locks.setdefault(state_key, threading.Lock())
+        with world_lock:
+            started_ns = self._clock_ns()
+            world = self._world(state_key, task_id)
             arguments = self._translate_arguments(
-                session_id, world, app_name, api_name, dict(request.get("arguments") or {})
+                state_key, world, app_name, api_name, dict(request.get("arguments") or {})
             )
             code = "import json\n" + _render_call(expression, arguments) + "\nprint(json.dumps(response, default=str))"
             output = world.execute(code)
@@ -139,18 +149,22 @@ class AppWorldAdapter:
                     except json.JSONDecodeError:
                         continue
                     if isinstance(result, dict) and result.get("access_token"):
-                        self.tokens.setdefault(session_id, {})[app_name] = result["access_token"]
+                        self.tokens.setdefault(state_key, {})[app_name] = result["access_token"]
                         break
-        elapsed_ms = (self._clock_ns() - started_ns) / 1e6
+            elapsed_ms = (self._clock_ns() - started_ns) / 1e6
         event = {
             "event": "appworld_tool",
+            "timestamp_unix_ns": time.time_ns(),
             "session_id": session_id,
+            "run_key": run_key,
+            "trace_id": str(request.get("trace_id") or ""),
             "task_id": task_id,
             "tool": name,
             "turn": request.get("turn"),
             "call": request.get("call"),
             "arguments_sha256": _arguments_sha256(original_arguments),
             "elapsed_ms": round(elapsed_ms, 3),
+            "queue_wait_ms": round((started_ns - queued_ns) / 1e6, 3),
             "result_bytes": len((output or "").encode("utf-8")),
         }
         with self.lock:
@@ -225,7 +239,7 @@ def main() -> int:
             print(format % args, flush=True)
 
     print(f"AppWorld adapter listening on {args.host}:{args.port}", flush=True)
-    HTTPServer((args.host, args.port), Handler).serve_forever()
+    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
     return 0
 
 

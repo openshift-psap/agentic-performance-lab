@@ -146,12 +146,12 @@ def _export_session_span(res: RequestResult) -> None:
         pass
 
 
-def _read_sse_edges(resp) -> tuple[float | None, int, int, bytes, dict[str, Any]]:
+def _read_sse_edges(resp, *, t_send_ns: int | None = None) -> tuple[float | None, int, int, bytes, dict[str, Any]]:
     """Read SSE stream and retain event-phase timestamps for the client edge.
 
     TTFT = time to first CONTENT/tool token (not the connection open).
     """
-    started = time.perf_counter()
+    started_ns = t_send_ns if t_send_ns is not None else time.perf_counter_ns()
     ttft: float | None = None
     t_first_ns = 0
     n_events = 0
@@ -215,7 +215,7 @@ def _read_sse_edges(resp) -> tuple[float | None, int, int, bytes, dict[str, Any]
         if "tool" in etype.lower() or "function_call" in etype.lower():
             got_tool = True
         phases["events"].append({
-            "at_ms": round((now_ns - int(started * 1e9)) / 1e6, 3),
+            "at_ms": round((now_ns - started_ns) / 1e6, 3),
             "type": event_type,
             "content": got_content,
             "reasoning": got_reasoning,
@@ -224,8 +224,8 @@ def _read_sse_edges(resp) -> tuple[float | None, int, int, bytes, dict[str, Any]
         phases["first_content_ns"] = phases["first_content_ns"] or (now_ns if got_content else 0)
         phases["first_reasoning_ns"] = phases["first_reasoning_ns"] or (now_ns if got_reasoning else 0)
         phases["first_tool_ns"] = phases["first_tool_ns"] or (now_ns if got_tool else 0)
-        if got:
-            ttft = (time.perf_counter() - started) * 1000.0
+        if got and ttft is None:
+            ttft = (now_ns - started_ns) / 1e6
             t_first_ns = now_ns
     return ttft, t_first_ns, n_events, b"".join(chunks), phases
 
@@ -272,7 +272,7 @@ def run_one(session: dict[str, Any], *, layer: str, url: str, model: str | None,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = int(getattr(resp, "status", 200))
             if stream:
-                ttft_ms, t_first_ns, n_events, body, phases = _read_sse_edges(resp)
+                ttft_ms, t_first_ns, n_events, body, phases = _read_sse_edges(resp, t_send_ns=t_send_ns)
                 t_end_ns = time.perf_counter_ns()
             else:
                 body = resp.read()
@@ -518,6 +518,7 @@ def drive_session_turns(
     # session identity remains stable for replay matching, while OpenClaw gets
     # a unique user/session key for this run.
     user_key = user_key_override or f"trace-replay:{session_id}:{uuid.uuid4().hex[:10]}"
+    replay_run_key = uuid.uuid4().hex
     out_dir.mkdir(parents=True, exist_ok=True)
     run_started = time.time()
     measured_started = run_started
@@ -527,6 +528,7 @@ def drive_session_turns(
     if prewarm:
         warmup_prompt = (
             f"REPLAY_SESSION_ID={session_id}\n"
+            f"REPLAY_RUN_KEY={replay_run_key}\n"
             "REPLAY_WARMUP=1\n"
             f"<!--replay-session:{session_id}-->\n"
             "Prepare the execution environment and reply with warmup."
@@ -597,6 +599,7 @@ def drive_session_turns(
         )
         prompt = (
             f"REPLAY_SESSION_ID={session_id}\n"
+            f"REPLAY_RUN_KEY={replay_run_key}\n"
             f"REPLAY_TURN_INDEX={turn_index}\n"
             f"<!--replay-session:{session_id}-->\n"
             f"<!--replay-turn:{turn_index}-->\n"
@@ -662,6 +665,7 @@ def drive_client_turns(
     prewarm: bool = False,
     prewarm_only: bool = False,
     user_key_override: str | None = None,
+    client_gap_ms: float = 0.0,
     harness: str = "openclaw",
 ) -> dict[str, Any]:
     """Drive only the user side of the recorded conversation.
@@ -690,6 +694,7 @@ def drive_client_turns(
     # session identity remains stable for replay matching, while OpenClaw gets
     # a unique user/session key for this run.
     user_key = user_key_override or f"trace-replay:{session_id}:{uuid.uuid4().hex[:10]}"
+    replay_run_key = uuid.uuid4().hex
     out_dir.mkdir(parents=True, exist_ok=True)
     run_started = time.time()
     measured_started = run_started
@@ -699,6 +704,7 @@ def drive_client_turns(
     if prewarm:
         warmup_prompt = (
             f"REPLAY_SESSION_ID={session_id}\n"
+            f"REPLAY_RUN_KEY={replay_run_key}\n"
             "REPLAY_WARMUP=1\n"
             f"<!--replay-session:{session_id}-->\n"
             "Prepare the execution environment and reply with warmup."
@@ -761,11 +767,14 @@ def drive_client_turns(
             (out_dir / "requests.jsonl").write_text("", encoding="utf-8")
             return summary
         measured_started = time.time()
-    for event in events:
+    for event_index, event in enumerate(events):
+        if event_index and client_gap_ms > 0:
+            time.sleep(client_gap_ms / 1000.0)
         turn_index = int(event.get("turn_index") or 0)
         content = str(event.get("content") or "").strip() or "Continue the recorded conversation."
         prompt = (
             f"REPLAY_SESSION_ID={session_id}\n"
+            f"REPLAY_RUN_KEY={replay_run_key}\n"
             f"<!--replay-session:{session_id}-->\n"
             f"<!--replay-client-turn:{turn_index}-->\n"
             f"{content}"
@@ -802,6 +811,7 @@ def drive_client_turns(
         "prewarm": prewarm,
         "prewarm_only": prewarm_only,
         "user_key": user_key,
+        "client_gap_policy_ms": client_gap_ms,
         "warmup": warmup_metadata,
         "run_start_unix": run_started,
         "start_unix": measured_started,
@@ -848,9 +858,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="run only the synthetic prewarm request and exit")
     parser.add_argument("--user-key", default=None,
                         help="stable OpenClaw user/session key for sandbox reuse across Jobs")
+    parser.add_argument("--client-gap-ms", type=float, default=0.0,
+                        help="configured wait between recorded client messages; 0 means no human think time")
     args = parser.parse_args(argv)
     if args.client_turns and args.session_turns:
         parser.error("--client-turns and --session-turns are mutually exclusive")
+    if args.client_gap_ms < 0:
+        parser.error("--client-gap-ms must be nonnegative")
     if args.client_turns:
         summary = drive_client_turns(
             corpus=Path(args.corpus), out_dir=Path(args.out), layer=args.layer,
@@ -860,6 +874,7 @@ def main(argv: list[str] | None = None) -> int:
             prewarm=args.prewarm,
             prewarm_only=args.prewarm_only,
             user_key_override=args.user_key,
+            client_gap_ms=args.client_gap_ms,
             harness=args.harness,
         )
     elif args.session_turns:

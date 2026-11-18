@@ -58,3 +58,32 @@ def test_functional_conformance_rejects_wrong_arguments(tmp_path):
     report = verify_trace(_make_trace(tmp_path, wrong_hash=True))
     assert report["status"] == "FAIL"
     assert "stateful_backend_arguments" in [check["name"] for check in report["checks"] if check["status"] == "FAIL"]
+
+
+def test_swe_conformance_rejects_new_missing_dependency_even_with_zero_exit(tmp_path):
+    trace = tmp_path / "swe-trace"
+    (trace / "data/shell/profile-v2/diagrams").mkdir(parents=True)
+    (trace / "data/shell").mkdir(exist_ok=True)
+    arguments = {"command": "python3 -m pytest tests/ | tail -3"}
+    session = {"session_id": "swe-1", "swe_task": {"base_commit": "abc"},
+               "turns": [{"index": 0, "tool_calls": [{"name": "mcp__environment__bash",
+                                                "arguments": arguments,
+                                                "recorded_result": json.dumps({"output": "2 passed", "returncode": 0})}]}]}
+    (trace / "input_corpus.json").write_text(json.dumps({"sessions": [session]}))
+    (trace / "data/shell/mock_edges.jsonl").write_text(json.dumps({
+        "session_id": "swe-1", "turn_seq": 0, "n_tool_calls": 1,
+    }) + "\n")
+    fields = ["turn", "response_processing_ms", "tool_dispatch_overhead_ms",
+              "openshell_exec_ms", "tool_failure_ms"]
+    with (trace / "data/shell/profile-v2/diagrams/per_turn_efficiency.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow(dict.fromkeys(fields, 0))
+    event = {"event": "swebench_tool", "session_id": "swe-1", "tool": "mcp__environment__bash",
+             "turn": 0, "call": 0, "arguments_sha256": arguments_sha256(arguments),
+             "execution_mode": "sandbox", "sandbox_base_commit": "abc",
+             "sandbox_returncode": 0, "sandbox_dependency_failure": True}
+    report = verify_trace(trace, backend_kind="swebench", backend_event_name="swebench_tool",
+                          backend_events=[event])
+    assert report["status"] == "FAIL"
+    assert "swe_dependency_failures" in [check["name"] for check in report["checks"] if check["status"] == "FAIL"]

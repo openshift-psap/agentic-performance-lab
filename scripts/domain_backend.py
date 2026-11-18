@@ -3,9 +3,9 @@
 
 This service is intentionally separate from the LLM simulator.  It receives
 tool calls over an internal HTTP boundary, owns per-session state, performs
-domain operations, and emits auditable events.  For SWE, it never owns or
-pretends to own a repository: OpenShell executes the command in the pinned
-task image and this service records the returned evidence.  The implementations
+domain operations, and emits auditable events. For SWE, it never owns or
+pretends to own a repository: OpenShell executes the command against a staged
+repository checkout and this service records the returned evidence. The implementations
 are benchmark environments for the replay corpus; they are not claims of
 official SWE-bench, BrowseComp, or τ-bench evaluation correctness.
 """
@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,12 +59,13 @@ class DomainBackend:
         self.workload = workload
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
-        self.sessions: dict[str, dict[str, Any]] = {}
+        self.sessions: dict[str | tuple[str, str], dict[str, Any]] = {}
         self.events: list[dict[str, Any]] = []
         self.lock = threading.Lock()
 
-    def _state(self, session_id: str, benchmark: str) -> dict[str, Any]:
-        state = self.sessions.get(session_id)
+    def _state(self, session_id: str, benchmark: str, run_key: str = "") -> dict[str, Any]:
+        state_key: str | tuple[str, str] = (run_key, session_id) if run_key else session_id
+        state = self.sessions.get(state_key)
         if state is not None:
             return state
         state = {
@@ -78,7 +80,7 @@ class DomainBackend:
             "support_updates": 0,
             "bookings": {},
         }
-        self.sessions[session_id] = state
+        self.sessions[state_key] = state
         return state
 
     def _swe_result(
@@ -108,7 +110,7 @@ class DomainBackend:
                 "base_commit": str(result.get("base_commit") or ""),
             })
         return json.dumps({
-            "output": "SWE execution must come from the OpenShell task-image sandbox",
+            "output": "SWE execution must come from the OpenShell sandbox with a staged repository",
             "returncode": 125,
             "execution": "backend-fallback-rejected",
         })
@@ -165,7 +167,10 @@ class DomainBackend:
         item[text_field] = (words * ((padding // len(words)) + 1))[:padding]
         return json.dumps(result)
 
-    def _support_result(self, state: dict[str, Any], tool: str, arguments: dict[str, Any]) -> str:
+    def _support_result(
+        self, state: dict[str, Any], tool: str, arguments: dict[str, Any],
+        recorded_result_bytes: int | None = None,
+    ) -> str:
         lowered = tool.lower()
         if "login" in lowered or "auth" in lowered:
             state["authenticated"] = True
@@ -173,23 +178,36 @@ class DomainBackend:
         if any(word in lowered for word in ("book", "reserve", "create")):
             booking_id = f"BK-{state['session_id'][:8]}-{state['version'] + 1:03d}"
             state["bookings"][booking_id] = {"status": "created", "arguments": _canonical(arguments)}
-            return json.dumps({"ok": True, "booking_id": booking_id, "status": "created"})
-        return json.dumps({
+            result = json.dumps({"ok": True, "booking_id": booking_id, "status": "created"})
+        else:
+            result = json.dumps({
             "ok": True,
             "policy_state": "authenticated" if state["authenticated"] else "anonymous",
             "updates": state["support_updates"],
             "result": f"Support operation {tool} completed against the session policy store.",
         })
+        if recorded_result_bytes is None:
+            return result
+        if recorded_result_bytes < 0:
+            raise ValueError("recorded result size cannot be negative")
+        if recorded_result_bytes < len(result.encode("utf-8")):
+            # The controlled backend cannot preserve its full JSON envelope
+            # in a shorter recorded response; retain the measured byte size.
+            return result[:recorded_result_bytes]
+        return result + (" " * (recorded_result_bytes - len(result.encode("utf-8"))))
 
     def execute(self, request: dict[str, Any]) -> dict[str, Any]:
         session_id = str(request.get("session_id") or "")
         if not session_id:
             return {"ok": False, "error": "session_id is required"}
         tool = str(request.get("tool") or "unknown")
+        run_key = str(request.get("run_key") or "")
+        if run_key and not re.fullmatch(r"[0-9a-f]{32}", run_key):
+            return {"ok": False, "error": "invalid replay run key"}
         arguments = dict(request.get("arguments") or {})
         started = now_ns()
         with self.lock:
-            state = self._state(session_id, str(request.get("benchmark") or self.workload))
+            state = self._state(session_id, str(request.get("benchmark") or self.workload), run_key)
             state["version"] += 1
             if self.workload == "software_engineering_qa":
                 result = self._swe_result(
@@ -204,9 +222,12 @@ class DomainBackend:
                     state, tool, arguments, request.get("recorded_result_bytes")
                 )
             else:
-                result = self._support_result(state, tool, arguments)
+                result = self._support_result(state, tool, arguments, request.get("recorded_result_bytes"))
             event = {
                 "event": EVENT_NAMES[self.workload],
+                "timestamp_unix_ns": time.time_ns(),
+                "trace_id": str(request.get("trace_id") or ""),
+                "run_key": run_key,
                 "backend": f"trace-replay-{self.workload}-backend",
                 "session_id": session_id,
                 "workload": self.workload,
@@ -226,6 +247,10 @@ class DomainBackend:
                     event["sandbox_repo_root"] = str(sandbox_result.get("repo_root") or "")
                     event["sandbox_base_commit"] = str(sandbox_result.get("base_commit") or "")
                     event["sandbox_returncode"] = int(sandbox_result.get("returncode") or 0)
+                    event["sandbox_dependency_failure"] = bool(re.search(
+                        r"ModuleNotFoundError|No module named\s+\S+|ImportError:",
+                        str(sandbox_result.get("output") or ""), re.IGNORECASE,
+                    ))
                     if sandbox_result.get("operation") == "command":
                         for field in (
                             "command_started_epoch_ns", "command_ended_epoch_ns", "command_wall_ns",

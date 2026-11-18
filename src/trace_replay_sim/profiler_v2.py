@@ -161,7 +161,7 @@ def _context_span(contexts: list[dict[str, Any]], model: dict[str, Any]) -> dict
     return max(before_model, key=lambda span: _end_ms(span) or 0) if before_model else None
 
 
-def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, int], dict[str, Any]]) -> list[dict[str, Any]]:
+def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
     trace_id = str(trace.get("traceID") or "")
     spans = trace.get("spans") or []
     models = sorted((span for span in spans if span.get("operationName") == "openclaw.model.call"),
@@ -242,8 +242,11 @@ def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, int], dict[str, An
         sandbox_cold_exec_ms = None
         if following_execs and following_execs[0].get("spanID") == (execs[0].get("spanID") if execs else None):
             sandbox_cold_exec_ms = _span_ms(following_execs[0])
-        edge = edges.get((trace_id, turn), {})
-        next_edge = edges.get((trace_id, turn + 1), {})
+        edge = edges.get((trace_id, str(model.get("spanID") or "")), {})
+        next_edge = (
+            edges.get((trace_id, str(models[turn + 1].get("spanID") or "")), {})
+            if turn + 1 < len(models) else {}
+        )
         response_processing_full_ms = None
         if edge.get("t_first_emit_ns") is not None and next_edge.get("t_recv_ns") is not None:
             decode_ms = None
@@ -265,6 +268,7 @@ def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, int], dict[str, An
                 response_boundary = "model_end_to_tool_start" if first_tool else "model_end_to_next_model"
         rows.append({
             "trace_id": trace_id,
+            "model_span_id": str(model.get("spanID") or ""),
             "turn": turn,
             "observation_unit": _first(tags, "openclaw.model_call.observation_unit") or "request",
             "model": _first(tags, "gen_ai.request.model", "openclaw.model"),
@@ -333,26 +337,37 @@ def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, int], dict[str, An
     return rows
 
 
-def _model_edge_index(edges: list[dict[str, Any]]) -> dict[tuple[str, int], dict[str, Any]]:
-    """Preserve both mock edges emitted by one session-turn request."""
+def _model_edge_index(
+    edges: list[dict[str, Any]], raw_traces: list[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Join mock edges to model spans by their recorded parent span ID.
+
+    Older exports without parent IDs remain unpaired. Equal row counts do not
+    establish identity when a dropped span and a retried span cancel out.
+    """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for edge in edges:
         trace_id = str(edge.get("trace_id") or "")
         if trace_id and int(edge.get("turn_seq", -1)) >= 0:
             grouped.setdefault(trace_id, []).append(edge)
-    indexed: dict[tuple[str, int], dict[str, Any]] = {}
-    for trace_id, trace_edges in grouped.items():
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for trace in raw_traces:
+        trace_id = str(trace.get("traceID") or "")
+        trace_edges = grouped.get(trace_id, [])
         ordered = sorted(
             trace_edges,
             key=lambda edge: (int(edge.get("turn_seq", 0)), int(edge.get("t_recv_ns") or 0)),
         )
-        for model_index, edge in enumerate(ordered):
-            indexed[(trace_id, model_index)] = edge
+        if any(edge.get("parent_span_id") for edge in ordered):
+            for edge in ordered:
+                parent = str(edge.get("parent_span_id") or "")
+                if parent:
+                    indexed[(trace_id, parent)] = edge
     return indexed
 
 
 def build_rows(raw_traces: list[dict[str, Any]], edges: list[dict[str, Any]], driver_requests: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    edge_map = _model_edge_index(edges)
+    edge_map = _model_edge_index(edges, raw_traces)
     rows: list[dict[str, Any]] = []
     for trace in raw_traces:
         rows.extend(_trace_rows(trace, edge_map))
@@ -371,7 +386,8 @@ def build_rows(raw_traces: list[dict[str, Any]], edges: list[dict[str, Any]], dr
             previous_end = request_start if index == 0 else trace_edges[index - 1].get("t_end_emit_wall_ns")
             if previous_end is None or edge.get("t_recv_wall_ns") is None:
                 continue
-            match = next((row for row in rows if row["trace_id"] == trace_id and row["turn"] == int(edge.get("turn_seq", index))), None)
+            parent = str(edge.get("parent_span_id") or "")
+            match = next((row for row in rows if row["trace_id"] == trace_id and row.get("model_span_id") == parent), None) if parent else None
             if match:
                 match["prompt_boundary_ms"] = round((int(edge["t_recv_wall_ns"]) - int(previous_end)) / 1e6, 3)
         ordered_rows = sorted(
@@ -485,18 +501,11 @@ def _collapse_logical_rows(
             row["sandbox_execution_bucket_ms"] = 0.0
             row["tool_failure_bucket_ms"] = 0.0
         else:
-            if edge and previous_edge:
-                row["context_assembly_bucket_ms"] = round(
-                    max(
-                        0,
-                        int(edge.get("t_recv_wall_ns") or 0)
-                        - int(previous_edge.get("t_end_emit_wall_ns") or 0),
-                    )
-                    / 1e6,
-                    3,
-                )
-            else:
-                row["context_assembly_bucket_ms"] = row.get("prompt_boundary_ms")
+            if edge and previous_edge and edge.get("t_recv_wall_ns") is not None and previous_edge.get("t_end_emit_wall_ns") is not None:
+                row["prompt_boundary_ms"] = round(max(
+                    0.0,
+                    (int(edge["t_recv_wall_ns"]) - int(previous_edge["t_end_emit_wall_ns"])) / 1e6,
+                ), 3)
             # The primary waterfall reports the measured response-processing
             # span only.  The larger model-to-continuation interval contains
             # OpenClaw/OpenShell dispatch waiting and is retained in the
@@ -505,6 +514,22 @@ def _collapse_logical_rows(
             row["tool_dispatch_overhead_bucket_ms"] = 0.0
             row["sandbox_execution_bucket_ms"] = previous.get("exec_ms") or 0.0 if previous else 0.0
             row["tool_failure_bucket_ms"] = previous.get("tool_failure_ms") or 0.0 if previous else 0.0
+            measured_context = row.get("context_assembly_window_ms")
+            if previous and previous.get("trace_id") == row.get("trace_id") and measured_context is not None:
+                row["context_assembly_bucket_ms"] = measured_context
+            elif row.get("prompt_boundary_ms") is not None:
+                # Across client requests the broad boundary includes the
+                # preceding response and tool. Assign only the residual to
+                # preparation; never add the full boundary to those stages.
+                row["context_assembly_bucket_ms"] = round(max(
+                    0.0,
+                    float(row["prompt_boundary_ms"])
+                    - float(row["response_processing_bucket_ms"])
+                    - float(row["sandbox_execution_bucket_ms"])
+                    - float(row["tool_failure_bucket_ms"]),
+                ), 3)
+            else:
+                row["context_assembly_bucket_ms"] = measured_context
         row["turn"] = turn
         row["sandbox_init_bucket_ms"] = row.get("sandbox_init_ms")
         logical.append(row)
@@ -956,6 +981,7 @@ def _plots(rows: list[dict[str, Any]], prom_dir: Path | None, out: Path) -> list
     for row in rows:
         sandbox_init = float(row.get("sandbox_init_bucket_ms") or 0.0)
         prompt_boundary = float(row.get("prompt_boundary_ms") or 0.0)
+        context = float(row.get("context_assembly_bucket_ms") or 0.0)
         response_processing = float(row.get("response_processing_full_ms") or 0.0)
         dispatch_overhead = float(row.get("tool_dispatch_overhead_bucket_ms") or 0.0)
         sandbox_exec = float(row.get("sandbox_execution_bucket_ms") or 0.0)
@@ -965,13 +991,14 @@ def _plots(rows: list[dict[str, Any]], prom_dir: Path | None, out: Path) -> list
         # particular, response/tool values are zero for turn 0 and represent
         # the previous model response on later rows.
         phase_response = float(row.get("response_processing_bucket_ms") or 0.0)
-        openclaw_overhead = prompt_boundary + phase_response + dispatch_overhead
+        openclaw_overhead = context + phase_response + dispatch_overhead
         non_model_path = sandbox_init + openclaw_overhead + sandbox_exec + tool_failure
         efficiency_rows.append({
             "turn": int(row.get("turn") or 0),
             "model_call_ms": model_call,
             "sandbox_init_ms": sandbox_init,
-            "prompt_boundary_ms": prompt_boundary,
+            "prompt_boundary_ms": context,
+            "raw_prompt_boundary_ms": prompt_boundary,
             "response_processing_ms": phase_response,
             "response_processing_raw_ms": response_processing,
             "tool_dispatch_overhead_ms": dispatch_overhead,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -164,6 +165,12 @@ def select_tool_rich_sessions(
         profile = str(session.get("workload_profile") or session.get("benchmark") or "unknown")
         by_profile.setdefault(profile, []).append(session)
     selected: list[dict[str, Any]] = []
+    # Stable hash order avoids an ID-sorted prefix selecting the same kind of
+    # session whenever N changes. The seed is fixed for reproducible cohorts.
+    for candidates in by_profile.values():
+        candidates.sort(key=lambda session: hashlib.sha256(
+            ("agentic-performance-lab-v1:" + str(session.get("session_id") or "")).encode()
+        ).hexdigest())
     profiles = sorted(by_profile)
     while len(selected) < limit and profiles:
         progressed = False

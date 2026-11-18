@@ -25,10 +25,10 @@ def classify_session(session: dict[str, Any]) -> dict[str, Any]:
     harness = str(session.get("harness") or "")
     if not turns:
         status = "exclude_no_turns"
-    elif harness in OPAQUE_HARNESSES:
-        status = "opaque_harness_only"
     elif nested:
         status = "exclude_nested_or_subagent"
+    elif harness in OPAQUE_HARNESSES:
+        status = "opaque_harness_only"
     elif missing:
         status = "partial_tool_results"
     elif harness in NATIVE_HARNESSES:
