@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import fcntl
 import hashlib
 import io
@@ -44,23 +45,64 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 # Baseline objects are explicitly owned by this benchmark. Run-scoped objects
 # use an additional hash suffix; these names are template/telemetry services
 # and are never deleted by the controller.
-BASE_JAEGER = "trace-replay-jaeger"
-BASE_MOCK_LLM = "trace-replay-mock-llm"
-BASE_OPENCLAW = "trace-replay-openclaw-shell"
-BASE_OPENCLAW_CONFIG = "trace-replay-openclaw-shell-config"
+RESOURCE_PREFIX = os.environ.get("TRACE_REPLAY_RESOURCE_PREFIX", "trace-replay").strip()
+if not re.fullmatch(r"[a-z][a-z0-9-]{1,18}[a-z0-9]", RESOURCE_PREFIX):
+    raise ValueError("TRACE_REPLAY_RESOURCE_PREFIX must be a DNS-compatible prefix of 3–20 characters")
+# The OpenClaw OpenShell plugin addresses the gateway by *name* whenever one is
+# configured, and the CLI then resolves that name from its own registry before
+# it can build an SSH proxy.  A raw endpoint URL is not a registry entry, so
+# SSH-based transfers (workspace seeding) fail with a closed connection and the
+# seed leaves a broken workspace behind.  Registering the endpoint under a
+# stable name in the agent pod's CLI config keeps every call (exec, upload,
+# ssh-config) on one resolvable identity.
+OPENSHELL_GATEWAY_NAME = os.environ.get("TRACE_REPLAY_OPENSHELL_GATEWAY_NAME", "aharush-tracesim").strip()
+if not re.fullmatch(r"[a-z][a-z0-9-]{1,40}[a-z0-9]", OPENSHELL_GATEWAY_NAME):
+    raise ValueError("TRACE_REPLAY_OPENSHELL_GATEWAY_NAME must be a DNS-compatible name of 3-42 characters")
+STRICT_OWNERSHIP = os.environ.get("TRACE_REPLAY_STRICT_OWNERSHIP", "").lower() in {"1", "true", "yes"}
+OWNED_NAMESPACES = {
+    name.strip() for name in os.environ.get("TRACE_REPLAY_OWNED_NAMESPACES", "").split(",") if name.strip()
+}
+# OpenShell's gateway creates Sandbox resources in the namespace where that
+# shared gateway is installed.  Strict mode may therefore allow that one
+# existing namespace as a target for this run's explicitly prefixed resources;
+# every object written there still has to pass assert_owned_target().
+EXTERNAL_SANDBOX_NAMESPACE = os.environ.get("TRACE_REPLAY_EXTERNAL_SANDBOX_NAMESPACE", "").strip()
+
+
+def assert_owned_target(namespace: str, name: str) -> None:
+    """Fail closed before any strict-mode write outside this run's objects."""
+    if not STRICT_OWNERSHIP:
+        return
+    if namespace not in OWNED_NAMESPACES or not name.startswith(f"{RESOURCE_PREFIX}-"):
+        raise RuntimeError(f"strict ownership refused {namespace}/{name}")
+
+
+def assert_owned_namespace(namespace: str) -> None:
+    if STRICT_OWNERSHIP and namespace not in OWNED_NAMESPACES:
+        raise RuntimeError(f"strict ownership refused namespace {namespace}")
+BASE_JAEGER = f"{RESOURCE_PREFIX}-jaeger"
+BASE_MOCK_LLM = f"{RESOURCE_PREFIX}-mock-llm"
+BASE_OPENCLAW = f"{RESOURCE_PREFIX}-openclaw-shell"
+BASE_OPENCLAW_CONFIG = f"{RESOURCE_PREFIX}-openclaw-shell-config"
 APPWORLD_IMAGE = "ghcr.io/stonybrooknlp/appworld:latest"
 APPWORLD_DATA_CHECK = (
     "test -f /appworld/data/base_dbs/spotify.db "
     "&& test -d /appworld/data/tasks && printf PRESENT"
 )
-# The plain public image does not carry the OpenSSH client that the published
-# OpenShell plugin uses to reach a sandbox.  Use the benchmark's pinned
-# OpenShell-enabled image for experiment-owned gateways; callers may override
-# it explicitly when validating another approved image.
+# The experiment image's OpenClaw runtime and external OpenShell plugin must
+# use compatible plugin APIs.  This image is the public OpenShell-enabled build
+# used by the existing replay runs; callers may override it explicitly when
+# validating another approved image.
 EXPERIMENT_OPENCLAW_IMAGE = os.environ.get(
     "TRACE_REPLAY_OPENCLAW_IMAGE",
-    "quay.io/example/openclaw-openshell:latest",
+    "quay.io/sallyom/openclaw-openshell:latest",
 )
+EXPERIMENT_OPENSHELL_PLUGIN_VERSION = os.environ.get(
+    "TRACE_REPLAY_OPENSHELL_PLUGIN_VERSION",
+    "2026.8.1-beta.2",
+).strip()
+if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?", EXPERIMENT_OPENSHELL_PLUGIN_VERSION):
+    raise ValueError("TRACE_REPLAY_OPENSHELL_PLUGIN_VERSION must be a version number")
 
 from trace_replay_sim.collect import collect as collect_prometheus
 from trace_replay_sim.collect import skipped_report as skipped_prometheus_report
@@ -130,6 +172,15 @@ TRANSIENT_API_MARKERS = (
     "serviceunavailable",
     "service unavailable",
     "server is currently unable to handle the request",
+    # Concurrent experiment controllers can legitimately share template
+    # objects (for example the driver ConfigMap).  The loser of a `replace`
+    # gets a resourceVersion conflict; re-reading and retrying is correct.
+    "the object has been modified",
+    "operation cannot be fulfilled",
+    "please apply your changes to the latest version",
+    # A get-then-create upsert can lose a race with a concurrent controller
+    # or with its own earlier attempt; re-read and replace instead of failing.
+    "alreadyexists",
 )
 READ_ONLY_OC_COMMANDS = {"get", "wait", "rollout", "whoami", "config", "version", "api-resources", "cluster-info"}
 DEFAULT_KUEUE_NAMESPACE = "kueue-system"
@@ -216,6 +267,51 @@ def parse_pod_quantity(value: Any) -> int:
     raise ValueError(f"unsupported Kubernetes pod quantity: {value!r}")
 
 
+def parse_tool_cgroup_quota(value: str, period_us: int = 100_000) -> str:
+    """Translate a core count into the cgroup-v2 ``cpu.max`` quota form.
+
+    ``cpu.max`` expects ``"<quota_us> <period_us>"`` (or ``"max <period_us>"``).
+    Expressing the experiment's independent variable as quota gives an exact
+    CPU-time rate per sandbox that is independent of who else shares the
+    physical cores, unlike cpuset affinity alone.
+    """
+    try:
+        cores = float(str(value).strip())
+    except ValueError as exc:
+        raise ValueError("tool cgroup quota must be a number of cores") from exc
+    if not 0.0 < cores <= 1024.0:
+        raise ValueError("tool cgroup quota must be greater than 0 and at most 1024 cores")
+    if not 1_000 <= int(period_us) <= 1_000_000:
+        raise ValueError("tool cgroup quota period must be between 1000 and 1000000 microseconds")
+    quota_us = int(round(cores * int(period_us)))
+    if quota_us < 1_000:
+        raise ValueError("tool cgroup quota is below the 1 ms minimum for the chosen period")
+    return f"{quota_us} {int(period_us)}"
+
+
+def tool_cgroup_quota_cpu_quantity(quota: str) -> str:
+    """Translate a ``cpu.max`` quota string into a Kubernetes CPU quantity.
+
+    ``openshell sandbox create --cpu`` is the supported way to pin CPU on the
+    Kubernetes driver: it becomes the sandbox agent container's ``resources``
+    limit, which the kubelet turns into the same ``cpu.max`` quota.  Enforcing
+    it at pod creation avoids relying on a writable cgroupfs inside the
+    sandbox, which the container runtime mounts read-only.
+    """
+    parts = str(quota).split()
+    if len(parts) != 2 or parts[0] == "max":
+        raise ValueError(f"tool cgroup quota must be a finite '<quota> <period>': {quota!r}")
+    try:
+        cores = int(parts[0]) / int(parts[1])
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ValueError(f"invalid tool cgroup quota: {quota!r}") from exc
+    millicores = int(round(cores * 1000))
+    if millicores < 1:
+        raise ValueError("tool cgroup quota is below 1 millicore")
+    return f"{millicores}m"
+
+
+
 def workspace_name(prefix: str, index: int) -> str:
     """Return an OpenShell-compatible workspace name for an agent slot.
 
@@ -229,7 +325,7 @@ def workspace_name(prefix: str, index: int) -> str:
     if len(candidate) <= 19:
         return candidate
     token = hashlib.sha256(f"{prefix}:{index}".encode("utf-8")).hexdigest()[:7]
-    bounded = f"replay-{token}-{index}"
+    bounded = f"{RESOURCE_PREFIX[:7]}-{token}-{index}"
     if len(bounded) > 19:
         raise ValueError(f"cannot create an OpenShell workspace name for agent {index}")
     return bounded
@@ -241,7 +337,11 @@ def agent_name_prefix(out_name: str, run_hash: str) -> str:
     Agent ConfigMaps append ``-config-NN`` and use the object name as a label
     value, which Kubernetes limits to 63 bytes.
     """
-    return f"replay-{safe_name(out_name)[:24]}-{run_hash}-openclaw"
+    fixed = f"{RESOURCE_PREFIX}--{run_hash}-openclaw"
+    max_out_name = 63 - len("-config-100") - len(fixed)
+    if max_out_name < 1:
+        raise ValueError("resource prefix and run hash leave no room for agent names")
+    return f"{RESOURCE_PREFIX}-{safe_name(out_name)[:max_out_name].rstrip('-')}-{run_hash}-openclaw"
 
 
 def parse_workspace_pvcs(spec: str | None, target_nodes: tuple[str, ...]) -> dict[str, str]:
@@ -290,6 +390,14 @@ class Cluster:
         self._api_semaphore = threading.BoundedSemaphore(api_workers)
 
     def run(self, args: list[str], *, input_text: str | None = None, check: bool = True) -> str:
+        if STRICT_OWNERSHIP:
+            mutating = {"apply", "create", "replace", "delete", "patch", "scale", "set", "label", "annotate", "exec", "cp"}
+            if any(token in mutating for token in args):
+                try:
+                    namespace = args[args.index("-n") + 1]
+                except (ValueError, IndexError) as exc:
+                    raise RuntimeError(f"strict ownership requires an explicit namespace: {args}") from exc
+                assert_owned_namespace(namespace)
         LOG.debug("oc %s", " ".join(args))
         command = next((token for token in args if token in READ_ONLY_OC_COMMANDS), None)
         max_attempts = 4 if command is not None else 1
@@ -340,6 +448,7 @@ class Cluster:
 
     def delete_owned(self, namespace: str, kind: str, name: str) -> None:
         """Delete only an existing object carrying this run's ownership label."""
+        assert_owned_target(namespace, name)
         raw = self.run(["-n", namespace, "get", kind, name], check=False).strip()
         if not raw:
             return
@@ -364,9 +473,11 @@ class Cluster:
 
     def replace_json(self, value: dict[str, Any]) -> None:
         """Replace an existing object without creating a huge last-applied annotation."""
+        assert_owned_target(self.namespace, str(value.get("metadata", {}).get("name") or ""))
         self.run(["-n", self.namespace, "replace", "-f", "-"], input_text=json.dumps(value))
 
     def apply_json_in(self, namespace: str, value: dict[str, Any]) -> None:
+        assert_owned_target(namespace, str(value.get("metadata", {}).get("name") or ""))
         self.run(["-n", namespace, "apply", "-f", "-"], input_text=json.dumps(value))
 
     def apply_json_in_with_retry(self, namespace: str, value: dict[str, Any]) -> None:
@@ -398,10 +509,19 @@ class Cluster:
                 time.sleep(delay)
 
     def apply_yaml_in(self, namespace: str, value: str) -> None:
+        if STRICT_OWNERSHIP:
+            try:
+                import yaml
+            except ImportError as exc:
+                raise RuntimeError("strict ownership requires PyYAML to inspect manifests") from exc
+            for resource in yaml.safe_load_all(value):
+                if resource:
+                    assert_owned_target(namespace, str(resource.get("metadata", {}).get("name") or ""))
         self.run(["-n", namespace, "apply", "-f", "-"], input_text=value)
 
     def upsert_owned_configmap(self, namespace: str, value: dict[str, Any]) -> None:
         """Retry an idempotent owned ConfigMap operation across API flaps."""
+        assert_owned_target(namespace, str(value.get("metadata", {}).get("name") or ""))
         for attempt in range(8):
             try:
                 self._upsert_owned_configmap_once(namespace, value)
@@ -484,6 +604,7 @@ class Cluster:
     def upsert_owned_secret(self, namespace: str, value: dict[str, Any]) -> None:
         """Create/replace an experiment-owned Secret without logging its data."""
         name = str(value.get("metadata", {}).get("name") or "")
+        assert_owned_target(namespace, name)
         existing = self.run(["-n", namespace, "get", "secret", name], check=False).strip()
         if not existing:
             self.run(["-n", namespace, "create", "-f", "-"], input_text=json.dumps(value))
@@ -564,15 +685,37 @@ def ensure_shared_workspace(
     """
     if not workspace_names:
         raise ValueError("workspace_names must not be empty")
+    if len(workspace_names) != 1:
+        raise ValueError(
+            "the OpenShell Kubernetes driver requires an approval label per workspace; "
+            "a shared PVC can currently serve only one workspace under the default admission policy"
+        )
     if access_mode not in {"ReadWriteMany", "ReadWriteOnce"}:
         raise ValueError(f"unsupported workspace access mode: {access_mode}")
     node = target_node or cluster.node
+    attachment_labels = {
+        "openshell.ai/sandbox-attachable": "true",
+        "openshell.ai/sandbox-attachable-workspace": workspace_names[0],
+    }
     existing = cluster.run(["-n", openshell_ns, "get", "pvc", pvc_name], check=False).strip()
     if existing:
         pvc = json.loads(cluster.run(["-n", openshell_ns, "get", "pvc", pvc_name, "-o", "json"]))
         labels = pvc.get("metadata", {}).get("labels") or {}
         if labels.get("managed-by") != "trace-replay-experiment":
             raise RuntimeError(f"refusing to reuse unowned PVC {openshell_ns}/{pvc_name}")
+        for key, expected in attachment_labels.items():
+            observed = labels.get(key)
+            if observed and observed != expected:
+                raise RuntimeError(
+                    f"owned PVC {openshell_ns}/{pvc_name} is approved for a different workspace"
+                )
+        missing_labels = [
+            f"{key}={value}"
+            for key, value in attachment_labels.items()
+            if not labels.get(key)
+        ]
+        if missing_labels:
+            cluster.run(["-n", openshell_ns, "label", "pvc", pvc_name, *missing_labels])
         spec = pvc.get("spec", {})
         if access_mode not in (spec.get("accessModes") or []) or (
             storage_class and spec.get("storageClassName") != storage_class
@@ -591,13 +734,17 @@ def ensure_shared_workspace(
             "kind": "PersistentVolumeClaim",
             "metadata": {
                 "name": pvc_name,
-                "labels": {"managed-by": "trace-replay-experiment", "component": "openshell-shared-workspace"},
+                "labels": {
+                    "managed-by": "trace-replay-experiment",
+                    "component": "openshell-shared-workspace",
+                    **attachment_labels,
+                },
             },
             "spec": workspace_spec,
         })
     # Keep the preparation Job scoped to this run's workspace prefix.  Delete
     # a stale copy first so a retry can recreate it with the current subpaths.
-    prep_name = f"{workspace_names[0][:55]}-workspace-prep"
+    prep_name = f"{RESOURCE_PREFIX}-{workspace_names[0][:39]}-workspace-prep"
     cluster.delete_owned(openshell_ns, "job", prep_name)
     names_literal = ",".join(repr(name) for name in workspace_names)
     prep = {
@@ -621,7 +768,20 @@ def ensure_shared_workspace(
                         "name": "prep",
                         "image": "python:3.12-slim",
                         "command": ["python", "-c"],
-                        "args": [f"import os; [os.makedirs('/mnt/workspaces/' + name, exist_ok=True) for name in ({names_literal},)]"],
+                        "args": [
+                            "import os\n"
+                            "def ensure(path):\n"
+                            "    if os.path.lexists(path) and not os.path.isdir(path):\n"
+                            "        os.unlink(path)\n"
+                            "    os.makedirs(path, exist_ok=True)\n"
+                            "    os.chmod(path, 0o2777)\n"
+                            f"names=({names_literal},)\n"
+                            "for name in names:\n"
+                            "    ensure('/mnt/workspaces/' + name)\n"
+                            "    ensure('/mnt/workspaces/' + name + '-oclaw')\n"
+                            "    ensure('/mnt/workspaces/' + name + '-oclaw/workspace')\n"
+                            "    ensure('/mnt/workspaces/' + name + '-oclaw/agent')\n"
+                        ],
                         "volumeMounts": [{"name": "shared-workspace", "mountPath": "/mnt/workspaces"}],
                     }],
                     "volumes": [{"name": "shared-workspace", "persistentVolumeClaim": {"claimName": pvc_name}}],
@@ -670,10 +830,10 @@ def stage_swe_repositories(
 
     def _stage_one_once(agent_index: int, task: dict[str, Any]) -> None:
         image = str(task.get("image") or "")
-        commit = str(task.get("base_commit") or "")
         repo_url = str(task.get("repo_url") or "")
-        if not repo_url:
-            raise RuntimeError(f"SWE task for agent {agent_index + 1} has no repository URL")
+        commit = str(task.get("base_commit") or "")
+        if not repo_url.startswith("https://github.com/"):
+            raise RuntimeError(f"SWE task for agent {agent_index + 1} has no approved public GitHub repository URL")
         workspace = workspace_names[agent_index]
         node = agent_nodes[agent_index]
         checkpoint = (checkpoint_dir / "swe-staging" / f"{agent_index + 1:03d}.json") if checkpoint_dir else None
@@ -687,18 +847,18 @@ def stage_swe_repositories(
         ):
             log_phase(f"SWE repository staging already verified; reusing agent {agent_index + 1}")
             return
-        job = f"trace-replay-swe-stage-{run_hash}-{agent_index + 1:03d}"
+        job = f"{RESOURCE_PREFIX}-swe-stage-{run_hash}-{agent_index + 1:03d}"
         command = (
             "set -eux; "
             "export GIT_CONFIG_GLOBAL=/tmp/trace-replay-gitconfig; "
             "git config --global --add safe.directory /testbed; "
-            "test -d /testbed/.git; "
-            "observed=$(git -C /testbed rev-parse HEAD); "
             # Keep repository staging inside the short-lived Job's own
             # emptyDir.  The OpenShell workspace PVC carries a sandbox-
             # specific SELinux label, so a separate staging pod must not
-            # write to it directly.  The verified tree is streamed into the
-            # already-running sandbox below, which has the matching label.
+            # write to it directly. Fetch the exact trajectory base commit
+            # from its public repository, verify it, then stream that tree
+            # into the already-running sandbox below. The task image tag is
+            # mutable and may contain a different checkout.
             "stage_root=/stage/repo; rm -rf \"$stage_root\"; mkdir -p \"$stage_root\"; "
             "git config --global --add safe.directory \"$stage_root\"; "
             "git -C \"$stage_root\" init; "
@@ -732,7 +892,9 @@ def stage_swe_repositories(
                             "image": image,
                             "command": ["/bin/sh", "-lc"],
                             "args": [command],
-                            "securityContext": {"runAsUser": 0},
+                        # Let OpenShift's restricted SCC assign the project UID.
+                        # Staging only reads /testbed and writes to the Job's
+                        # emptyDir, so it does not need root privileges.
                             "volumeMounts": [
                                 {"name": "stage-data", "mountPath": "/stage"},
                             ],
@@ -799,10 +961,15 @@ def stage_swe_repositories(
                 "t.add('/stage/repo', arcname='.'); t.close()"
             )
             target_code = (
-                "import os,shutil,sys,tarfile; root='/sandbox/.openshell/workspace'; "
+                "import os,shutil,subprocess,sys,tarfile; root='/sandbox/.openshell/workspace'; "
                 "os.makedirs(root,exist_ok=True); "
                 "[shutil.rmtree(os.path.join(root,n)) if os.path.isdir(os.path.join(root,n)) and not os.path.islink(os.path.join(root,n)) else os.unlink(os.path.join(root,n)) for n in os.listdir(root)]; "
-                "tarfile.open(fileobj=sys.stdin.buffer, mode='r|gz').extractall(root)"
+                "tarfile.open(fileobj=sys.stdin.buffer, mode='r|gz').extractall(root); "
+                # The extraction runs as root inside the sandbox pod, but the
+                # agent executes tools as the sandbox user.  Give the staged
+                # tree explicit write access instead of relying on an
+                # image-specific uid, otherwise every edit fails with EACCES.
+                "subprocess.run(['chmod','-R','a+rwX',root],check=True)"
             )
             source = subprocess.Popen(
                 ["oc", "-n", openshell_ns, "exec", "-i", stage_pod, "-c", "stage", "--", "python3", "-c", source_code],
@@ -947,7 +1114,7 @@ def _remove_failed_sandbox_for_workspace(
     annotation and name prefix are both checked before deletion; running or
     unrelated sandboxes are never touched.
     """
-    if not workspace.startswith("trace-replay-"):
+    if not workspace.startswith(f"{RESOURCE_PREFIX}-"):
         return
     for item in (cluster.json(["-n", openshell_ns, "get", "sandbox"]).get("items") or []):
         metadata = item.get("metadata") or {}
@@ -1110,7 +1277,6 @@ def prewarm_swe_sandboxes(
                 agent,
                 out / "traces",
                 system_ns,
-                system_ns,
                 f"swp{run_hash[:6]}{agent_index + 1:03d}",
                 allow_cross_node=allow_cross_node,
                 prewarm_requested=True,
@@ -1201,37 +1367,101 @@ def _stop_cgroup_samplers(samplers: list[tuple[subprocess.Popen[str], Any]]) -> 
         handle.close()
 
 
-def _merge_sandbox_cgroup_samples(cgroup_dir: Path) -> None:
+CGROUP_SAMPLE_COLUMNS = (
+    "epoch_ns",
+    "cpu_usage_usec",
+    "memory_bytes",
+    "user_usec",
+    "system_usec",
+    "nr_throttled",
+    "throttled_usec",
+    "cpu_quota",
+    "cpu_period",
+    "cpu_pressure_some_avg10",
+    "cpu_pressure_some_total",
+    "cpu_pressure_full_avg10",
+    "cpu_pressure_full_total",
+    "memory_pressure_some_avg10",
+    "memory_pressure_full_avg10",
+    "io_pressure_some_avg10",
+)
+
+
+def _cpu_quota_ratio(quota: str | None, period: str | None) -> float | None:
+    """Return the CPU-time rate encoded by ``cpu.max``, or None if unbounded."""
+    try:
+        quota_us = int(str(quota).strip())
+        period_us = int(str(period).strip())
+    except (TypeError, ValueError):
+        return None
+    if quota_us <= 0 or period_us <= 0:
+        return None
+    return quota_us / period_us
+
+
+def _merge_sandbox_cgroup_samples(cgroup_dir: Path, expected_quota: str = "") -> None:
     """Merge one file per sandbox into the canonical resource series.
 
     Multiple OpenShell sandboxes can be observed during one trace.  Writing
     all samplers directly to one file lets concurrent stdout streams
     interleave and corrupt rows.  Keep each sampler isolated, then merge only
-    complete numeric rows after sampling stops.
+    complete numeric rows after sampling stops.  Rows from older samplers that
+    lack the throttling or PSI columns are padded with zeroes so downstream
+    readers see one stable schema.
+
+    When ``expected_quota`` is set, every sample must show that CPU rate.  The
+    limit is applied to the sandbox pod at creation; this gate makes a silently
+    unbounded sandbox fail the run instead of producing invalid measurements.
     """
     raw_dir = cgroup_dir / "sandbox_samples"
-    rows: list[tuple[int, int, int]] = []
+    rows: list[dict[str, str]] = []
+    expected_ratio = (
+        _cpu_quota_ratio(*expected_quota.split()) if expected_quota else None
+    )
+    if expected_quota and expected_ratio is None:
+        raise ValueError(f"invalid expected sandbox CPU quota: {expected_quota!r}")
     for path in sorted(raw_dir.glob("*.csv")) if raw_dir.exists() else []:
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            with path.open(encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        epoch_ns = int(row.get("epoch_ns") or 0)
+                        cpu_usage_usec = int(row.get("cpu_usage_usec") or 0)
+                        memory_bytes = int(row.get("memory_bytes") or 0)
+                    except ValueError:
+                        continue
+                    if not (epoch_ns > 0 and cpu_usage_usec >= 0 and memory_bytes >= 0):
+                        continue
+                    if expected_ratio is not None:
+                        observed_ratio = _cpu_quota_ratio(
+                            row.get("cpu_quota"), row.get("cpu_period")
+                        )
+                        if (
+                            observed_ratio is None
+                            or abs(observed_ratio - expected_ratio) > 1e-6
+                        ):
+                            raise RuntimeError(
+                                f"sandbox CPU quota mismatch in {path.name}: "
+                                f"expected {expected_quota}, observed "
+                                f"{row.get('cpu_quota')} {row.get('cpu_period')}"
+                            )
+                    merged = {column: (row.get(column) or "0") for column in CGROUP_SAMPLE_COLUMNS}
+                    merged["epoch_ns"] = str(epoch_ns)
+                    merged["cpu_usage_usec"] = str(cpu_usage_usec)
+                    merged["memory_bytes"] = str(memory_bytes)
+                    rows.append(merged)
         except OSError:
             continue
-        for line in lines[1:]:
-            fields = line.split(",")
-            if len(fields) != 3:
-                continue
-            try:
-                epoch_ns, cpu_usage_usec, memory_bytes = (int(field) for field in fields)
-            except ValueError:
-                continue
-            if epoch_ns > 0 and cpu_usage_usec >= 0 and memory_bytes >= 0:
-                rows.append((epoch_ns, cpu_usage_usec, memory_bytes))
-    rows.sort(key=lambda row: row[0])
+    if expected_ratio is not None and not rows:
+        raise RuntimeError(
+            f"sandbox CPU quota {expected_quota} was not observed in any cgroup sample"
+        )
+    rows.sort(key=lambda row: int(row["epoch_ns"]))
     output = cgroup_dir / "openshell_sandbox.csv"
     with output.open("w", encoding="utf-8") as handle:
-        handle.write("epoch_ns,cpu_usage_usec,memory_bytes\n")
-        for epoch_ns, cpu_usage_usec, memory_bytes in rows:
-            handle.write(f"{epoch_ns},{cpu_usage_usec},{memory_bytes}\n")
+        handle.write(",".join(CGROUP_SAMPLE_COLUMNS) + "\n")
+        for row in rows:
+            handle.write(",".join(row[column] for column in CGROUP_SAMPLE_COLUMNS) + "\n")
 
 
 def _valid_cgroup_row_count(path: Path) -> int:
@@ -1242,10 +1472,10 @@ def _valid_cgroup_row_count(path: Path) -> int:
     count = 0
     for line in lines[1:]:
         fields = line.split(",")
-        if len(fields) != 3:
+        if len(fields) < 3:
             continue
         try:
-            epoch_ns, cpu_usage_usec, memory_bytes = (int(field) for field in fields)
+            epoch_ns, cpu_usage_usec, memory_bytes = (int(field) for field in fields[:3])
         except ValueError:
             continue
         if epoch_ns > 0 and cpu_usage_usec >= 0 and memory_bytes >= 0:
@@ -1332,13 +1562,21 @@ def _collect_backend_events(
     empty; this changes no backend or cluster state.
     """
     since = datetime.fromtimestamp(max(0.0, start - 5.0), timezone.utc).isoformat().replace("+00:00", "Z")
-    logs = cluster.run(
-        ["-n", backend.namespace, "logs", f"deployment/{backend.name}", "--timestamps", "--since-time", since],
-        check=False,
-    )
-    events = _decode_json_log_events(logs, session_id, backend.event_name)
-    if events:
-        return events
+    # Concurrent experiment controllers read the same shared backend log
+    # stream.  A transient API/stream failure would otherwise look like "this
+    # session emitted no events" and fail output validation, so retry an empty
+    # read before falling back to the read-only /events endpoint.
+    for attempt in range(3):
+        logs = cluster.run(
+            ["-n", backend.namespace, "logs", f"deployment/{backend.name}", "--timestamps", "--since-time", since],
+            check=False,
+        )
+        events = _decode_json_log_events(logs, session_id, backend.event_name)
+        if events:
+            return events
+        if logs.strip() or attempt == 2:
+            break
+        time.sleep(2.0)
 
     # The domain backend exposes /events on its loopback listener.  Read it
     # from the existing deployment so the controller does not need a new
@@ -1746,7 +1984,7 @@ def _appworld_backend_pod(cluster: Cluster, namespace: str) -> str:
     return cluster.run(
         [
             "-n", namespace, "get", "pod",
-            "-l", "app=trace-replay-appworld-backend",
+            "-l", f"app={RESOURCE_PREFIX}-appworld-backend",
             "-o", "jsonpath={.items[0].metadata.name}",
         ],
         check=False,
@@ -1787,7 +2025,7 @@ def verify_appworld_data(cluster: Cluster, namespace: str, node: str, pvc_name: 
             )
         log_phase(f"appworld: verified pre-populated data PVC {namespace}/{pvc_name} via {backend_pod}")
         return
-    probe_name = "trace-replay-appworld-data-check"
+    probe_name = f"{RESOURCE_PREFIX}-appworld-data-check"
     if cluster.run(["-n", namespace, "get", "pod", probe_name], check=False).strip():
         cluster.delete_owned(namespace, "pod", probe_name)
     cluster.apply_json_in(namespace, _appworld_data_pod(probe_name, pvc_name, node, "sleep 900"))
@@ -1860,7 +2098,7 @@ def ensure_appworld_data(
             raise RuntimeError(f"refusing to use unowned AppWorld PVC {namespace}/{pvc_name}")
     else:
         cluster.apply_json_in(namespace, pvc)
-    stage_name = "trace-replay-appworld-data-stage"
+    stage_name = f"{RESOURCE_PREFIX}-appworld-data-stage"
     stage = _appworld_data_pod(stage_name, pvc_name, node, "mkdir -p /appworld/data && sleep 900")
     cluster.apply_json_in(namespace, stage)
     try:
@@ -1929,7 +2167,7 @@ def ensure_workload_backends(
                         "apiVersion": "v1",
                         "kind": "Secret",
                         "metadata": {
-                            "name": "trace-replay-appworld-task-map",
+                            "name": f"{RESOURCE_PREFIX}-appworld-task-map",
                             "labels": {"managed-by": "trace-replay-experiment", "component": "appworld-task-map"},
                         },
                         "type": "Opaque",
@@ -1974,13 +2212,29 @@ def ensure_workload_backends(
                     resource = None
                 if resource:
                     name = str(resource.get("metadata", {}).get("name") or "")
-                    if name and not name.startswith("trace-replay-"):
+                    if name and not name.startswith(f"{RESOURCE_PREFIX}-"):
                         raise RuntimeError(f"managed backend manifest contains unowned resource {name}")
                 else:
                     names = re.findall(r"^\s+name:\s*([A-Za-z0-9][A-Za-z0-9-]*)\s*$", document, re.MULTILINE)
-                    if names and not names[0].startswith("trace-replay-"):
+                    if names and not names[0].startswith(f"{RESOURCE_PREFIX}-"):
                         raise RuntimeError(f"managed backend manifest contains unowned resource {names[0]}")
             cluster.apply_yaml_in(spec.namespace, manifest_text)
+            # The source ConfigMap is mounted at pod start, so an unchanged
+            # Deployment template would keep serving stale backend code. Bind
+            # the source hash to the pod template to roll the backend whenever
+            # the local source changes.
+            source_sha = hashlib.sha256(
+                "\n".join(f"{name}\n{text}" for name, text in sorted(source_data.items())).encode()
+            ).hexdigest()
+            cluster.run([
+                "-n", spec.namespace, "patch", "deployment", spec.name,
+                "--type=merge",
+                "-p", json.dumps({
+                    "spec": {"template": {"metadata": {"annotations": {
+                        "trace-replay.openai.com/backend-source-sha256": source_sha,
+                    }}}}
+                }),
+            ])
         # A real backend must expose its Service. For an existing backend this
         # is strictly read-only; for a managed one it follows the apply above.
         service = cluster.run(["-n", spec.namespace, "get", "svc", spec.service], check=False).strip()
@@ -2034,9 +2288,10 @@ def _rewrite_queue_backend_endpoints(
                 if not isinstance(command, list):
                     continue
                 rewritten = [str(part) for part in command]
-                for workload, spec in backends.items():
+                for workload, new_endpoint in endpoint_map.items():
+                    spec = backends[workload]
                     old = spec.base_url.rstrip("/")
-                    new = endpoint_map[workload].rstrip("/")
+                    new = new_endpoint.rstrip("/")
                     rewritten = [part.replace(old, new) for part in rewritten]
                 # AppWorld commands are transported as a base64-encoded
                 # Python client to stay below OpenShell's remote-command
@@ -2052,9 +2307,10 @@ def _rewrite_queue_backend_endpoints(
                         except (ValueError, UnicodeDecodeError):
                             decoded = ""
                         if decoded:
-                            for workload, spec in backends.items():
+                            for workload, new_endpoint in endpoint_map.items():
+                                spec = backends[workload]
                                 old = spec.base_url.rstrip("/")
-                                new = endpoint_map[workload].rstrip("/")
+                                new = new_endpoint.rstrip("/")
                                 decoded = decoded.replace(old, new)
                             rewritten[2] = (
                                 "echo "
@@ -2091,16 +2347,22 @@ def _clone_config(
     # workspace from OPENSHELL_WORKSPACE.  Keeping it out of plugin config also
     # lets the init container validate the config before the plugin is installed.
     entry["config"].pop("workspace", None)
-    # OpenShell 0.0.116 reserves /sandbox/.openshell/workspace for the
-    # mounted workspace.  The OpenClaw remote-mode seed path clears the
-    # configured remoteWorkspaceDir before uploading; setting it to /sandbox
-    # therefore attempts to remove that mount and fails with EBUSY.  Keep the
-    # OpenClaw-managed remote workspace in a sibling directory while the
-    # experiment's Kubernetes workspace mount remains available at its
-    # supported /sandbox/.openshell/workspace path (used by SWE commands).
-    entry["config"]["remoteWorkspaceDir"] = "/sandbox/workspace"
+    # OpenClaw remote mode seeds and clears remoteWorkspaceDir on first use.
+    # Keep its two remote roots below a dedicated PVC mount so seeding cannot
+    # erase the staged SWE repository mounted at /sandbox/.openshell/workspace.
+    # These paths also exist as writable mounts before the OpenClaw plugin
+    # connects, avoiding mkdir attempts against the sandbox image filesystem.
+    entry["config"]["remoteWorkspaceDir"] = "/sandbox/openclaw/workspace"
+    entry["config"]["remoteAgentWorkspaceDir"] = "/sandbox/openclaw/agent"
     if gateway_endpoint:
-        entry["config"]["gatewayEndpoint"] = gateway_endpoint
+        # Address the gateway by registered name (see OPENSHELL_GATEWAY_NAME).
+        # The name is registered in the CLI config by the gateway container's
+        # startup script, which is what lets SSH proxying (and therefore
+        # workspace seeding) work; passing the bare endpoint URL is not
+        # resolvable.  Drop any endpoint left over from the base config so the
+        # two identities cannot disagree.
+        entry["config"].pop("gatewayEndpoint", None)
+        entry["config"]["gateway"] = OPENSHELL_GATEWAY_NAME
     # Long research traces can legitimately spend several minutes crossing
     # repeated model/tool boundaries.  The base deployment carries a 180s
     # sandbox timeout for ordinary interactive use; raise it only in this
@@ -2152,6 +2414,10 @@ def _ensure_openshell_workspace(
     existing = cluster.run([*common, "workspace", "get", workspace, "--gateway-endpoint", gateway_endpoint], check=False)
     if existing.strip():
         return
+    if not workspace.startswith(f"{RESOURCE_PREFIX}-"):
+        raise RuntimeError(
+            f"refusing to create OpenShell workspace outside the owned prefix: {workspace}"
+        )
     cluster.run([*common, "workspace", "create", "--name", workspace, "--gateway-endpoint", gateway_endpoint])
 
 
@@ -2160,6 +2426,7 @@ def _ensure_openshell_client_secret(
     source_namespace: str,
     source_name: str,
     target_name: str,
+    oidc_token_path: Path | None = None,
 ) -> str:
     """Copy the gateway client bundle into the agent namespace under an owned name.
 
@@ -2187,6 +2454,18 @@ def _ensure_openshell_client_secret(
         "type": source.get("type", "Opaque"),
         "data": source.get("data", {}),
     }
+    if oidc_token_path is not None:
+        token_path = oidc_token_path.resolve()
+        if not token_path.is_file():
+            raise RuntimeError(f"OpenShell OIDC access token file is missing: {token_path}")
+        target["data"]["oidc_token.json"] = base64.b64encode(
+            json.dumps({
+                "access_token": token_path.read_text(encoding="utf-8").strip(),
+                "issuer": "https://aharush-oidc.aharush-agentic-cpu.svc.cluster.local:8443",
+                "client_id": "aharush-openshell-cli",
+                "expires_at": int(time.time()) + 36 * 3600,
+            }).encode("utf-8")
+        ).decode("ascii")
     cluster.apply_json_in(cluster.namespace, target)
     return target_name
 
@@ -2213,6 +2492,7 @@ def deploy_agents(
     reuse_existing_workspaces: bool = False,
     simulated_ttft_ms: float | None = None,
     simulated_itl_ms: float | None = None,
+    sandbox_cpu_limit: str | None = None,
 ) -> list[tuple[str, str, str]]:
     log_phase(f"deployment: preparing {agents} OpenClaw agents with isolated OpenShell workspaces")
     planned_nodes = tuple(agent_nodes or (cluster.node,))
@@ -2227,6 +2507,51 @@ def deploy_agents(
     if not reconcile_set.issubset(global_indices):
         raise ValueError("reconcile_indices must refer to deployed global agent indices")
     log_phase(f"deployment: workspace storage map={shared_workspace_pvcs or shared_workspace_pvc or 'per-sandbox-default'}")
+
+    openshell_cli_version = os.environ.get("TRACE_REPLAY_OPENSHELL_CLI_VERSION", "0.1.8").strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+", openshell_cli_version):
+        raise ValueError(f"invalid OpenShell CLI version: {openshell_cli_version!r}")
+
+    def pin_openshell_cli_version(deployment_obj: dict[str, Any]) -> bool:
+        """Keep the agent-side CLI aligned with the upstream gateway release."""
+        for init_container in deployment_obj.get("spec", {}).get("template", {}).get("spec", {}).get("initContainers", []):
+            if init_container.get("name") != "install-openshell-cli":
+                continue
+            args = init_container.setdefault("args", [])
+            for index, arg in enumerate(args):
+                script, count = re.subn(
+                    r'(?m)^(\s*ver\s*=\s*)["\'][^"\']+["\']',
+                    rf'\g<1>"{openshell_cli_version}"',
+                    str(arg),
+                    count=1,
+                )
+                if count:
+                    changed = script != arg
+                    args[index] = script
+                    return changed
+            raise RuntimeError("OpenClaw deployment has no recognized OpenShell CLI version in install-openshell-cli")
+        raise RuntimeError("OpenClaw deployment has no install-openshell-cli init container")
+
+    def pin_openshell_plugin_version(deployment_obj: dict[str, Any]) -> bool:
+        """Match the external plugin release to the OpenClaw runtime API."""
+        spec = deployment_obj.get("spec", {}).get("template", {}).get("spec", {})
+        for init_container in spec.get("initContainers", []):
+            if init_container.get("name") != "init-config":
+                continue
+            args = init_container.setdefault("args", [""])
+            command = str(args[0] if args else "")
+            replacement = f"@openclaw/openshell-sandbox@{EXPERIMENT_OPENSHELL_PLUGIN_VERSION}"
+            updated, count = re.subn(
+                r"@openclaw/openshell-sandbox(?:@[^\s]+)?",
+                replacement,
+                command,
+                count=1,
+            )
+            if not count:
+                raise RuntimeError("OpenClaw init-config has no OpenShell plugin install command")
+            args[0] = updated
+            return updated != command
+        raise RuntimeError("OpenClaw deployment has no init-config container")
 
     def install_plugin_compat_shim(deployment_obj: dict[str, Any]) -> bool:
         """Patch the public image's stale SDK export in the shared OpenClaw home."""
@@ -2325,6 +2650,8 @@ def deploy_agents(
         """Refresh node and sandbox pinning on an explicitly owned deployment."""
         deployment_obj = cluster.json(["-n", cluster.namespace, "get", "deployment", name])
         shim_changed = install_plugin_compat_shim(deployment_obj)
+        cli_changed = pin_openshell_cli_version(deployment_obj)
+        plugin_changed = pin_openshell_plugin_version(deployment_obj)
         sidecar_changed = install_local_mock_sidecar(deployment_obj)
         template = deployment_obj.setdefault("spec", {}).setdefault("template", {})
         template_metadata = template.setdefault("metadata", {})
@@ -2335,11 +2662,12 @@ def deploy_agents(
             config_hash_changed = template_annotations.get(annotation) != config_sha256
             template_annotations[annotation] = config_sha256
         template_spec = template.setdefault("spec", {})
+        startup_changed = False
         if allow_cross_node:
             template_spec.pop("nodeSelector", None)
         else:
             template_spec["nodeSelector"] = {"kubernetes.io/hostname": node}
-            _install_pinned_openshell_wrapper(
+            startup_changed = _install_pinned_openshell_wrapper(
                 deployment_obj,
                 node,
                 workspace,
@@ -2348,6 +2676,7 @@ def deploy_agents(
                 internal_api_endpoints=internal_api_endpoints,
                 gateway_endpoint=gateway_endpoint,
                 sandbox_image=sandbox_image_for(index),
+                sandbox_cpu_limit=sandbox_cpu_limit,
             )
         for container in template_spec.get("containers", []):
             if container.get("name") != "gateway":
@@ -2364,7 +2693,7 @@ def deploy_agents(
             else:
                 workspace_entry["value"] = workspace
         cluster.apply_json(deployment_obj)
-        return shim_changed or config_hash_changed or sidecar_changed
+        return shim_changed or config_hash_changed or sidecar_changed or cli_changed or plugin_changed or startup_changed
 
     if reuse and deployment_prefix:
         # A recovery run may reuse one explicitly named, experiment-owned
@@ -2439,7 +2768,7 @@ def deploy_agents(
             # otherwise it can try to exec into a gateway container that is
             # still in init (or no longer exists).
             wrapper_needs_rollout = (
-                "trace-replay-openshell-node-selector-v19-" not in init_config_text
+                "trace-replay-openshell-node-selector-v30-" not in init_config_text
                 or "sleep 2147483647" not in init_config_text
                 or "openshell-pinned" not in "\n".join(
                     str(container)
@@ -2500,7 +2829,7 @@ def deploy_agents(
             ), None)
             if configured_workspace:
                 workspace = str(configured_workspace)
-            if not reuse_existing_workspaces:
+            if not reuse_existing_workspaces or workspace.startswith(f"{RESOURCE_PREFIX}-"):
                 _ensure_openshell_workspace(
                     cluster,
                     name,
@@ -2523,10 +2852,10 @@ def deploy_agents(
                 name = f"{stem}-{global_index:02d}"
                 config = f"{stem}-config-{global_index:02d}"
             else:
-                name = f"trace-replay-openclaw-agent-{global_index}"
-                config = f"trace-replay-openclaw-config-{global_index}"
+                name = f"{RESOURCE_PREFIX}-openclaw-agent-{global_index}"
+                config = f"{RESOURCE_PREFIX}-openclaw-config-{global_index}"
         else:
-            stem = safe_name(deployment_prefix or "trace-replay-openclaw-agent")
+            stem = safe_name(deployment_prefix or f"{RESOURCE_PREFIX}-openclaw-agent")
             name = f"{stem}-{global_index:02d}"
             config = f"{stem}-config-{global_index:02d}"
         service = name
@@ -2578,7 +2907,7 @@ def deploy_agents(
             )
             if configured_workspace:
                 workspace = str(configured_workspace)
-            if not reuse_existing_workspaces:
+            if not reuse_existing_workspaces or workspace.startswith(f"{RESOURCE_PREFIX}-"):
                 _ensure_openshell_workspace(
                     cluster,
                     name,
@@ -2639,8 +2968,13 @@ def deploy_agents(
                 env = [item for item in container.setdefault("env", []) if item.get("name") != "OPENSHELL_FLEET_WORKSPACE"]
                 env.append({"name": "OPENSHELL_FLEET_WORKSPACE", "value": workspace})
                 container["env"] = env
+        for container in template["spec"].get("initContainers", []):
+            if container.get("name") == "init-config":
+                container["image"] = EXPERIMENT_OPENCLAW_IMAGE
         install_local_mock_sidecar(deployment)
         install_plugin_compat_shim(deployment)
+        pin_openshell_cli_version(deployment)
+        pin_openshell_plugin_version(deployment)
         if not allow_cross_node:
             _install_pinned_openshell_wrapper(
                 deployment,
@@ -2651,6 +2985,7 @@ def deploy_agents(
                 internal_api_endpoints=internal_api_endpoints,
                 gateway_endpoint=gateway_endpoint,
                 sandbox_image=sandbox_image_for(index),
+                sandbox_cpu_limit=sandbox_cpu_limit,
             )
         cluster.apply_json(deployment)
         service_obj = {
@@ -2845,7 +3180,8 @@ def _install_pinned_openshell_wrapper(
     internal_api_endpoints: list[str] | None = None,
     gateway_endpoint: str | None = None,
     sandbox_image: str | None = None,
-) -> None:
+    sandbox_cpu_limit: str | None = None,
+) -> bool:
     """Install a wrapper that pins and storage-wires sandbox pods at create time."""
     kubernetes_config: dict[str, Any] = {
         "pod": {"node_selector": {"kubernetes.io/hostname": node}},
@@ -2860,10 +3196,15 @@ def _install_pinned_openshell_wrapper(
                 "agent": {
                     "volume_mounts": [{
                         "name": "trace-replay-shared-workspace",
-                        # OpenShell 0.0.116 reserves the exact /sandbox
-                        # target.  Mount below its supported workspace path.
+                        # Keep the staged repo separate from OpenClaw's
+                        # remote-mode seed and agent workspace directories.
                         "mount_path": "/sandbox/.openshell/workspace",
                         "sub_path": workspace,
+                        "read_only": False,
+                    }, {
+                        "name": "trace-replay-shared-workspace",
+                        "mount_path": "/sandbox/openclaw",
+                        "sub_path": f"{workspace}-oclaw",
                         "read_only": False,
                     }],
                 },
@@ -2895,8 +3236,18 @@ def _install_pinned_openshell_wrapper(
             "        access: read-write"
             f"{tls_line}\n"
             "    binaries:\n"
+            # SWE task images vary by Python minor version and installation
+            # prefix. Keep backend access scoped to Python 3 interpreters and
+            # the single backend endpoint declared above.
             "      - path: /usr/sbin/python3\n"
+            "      - path: /usr/sbin/python3.*\n"
+            "      - path: /usr/bin/python3\n"
+            "      - path: /usr/bin/python3.*\n"
             "      - path: /usr/bin/python3.13\n"
+            "      - path: /usr/local/bin/python3\n"
+            "      - path: /usr/local/bin/python3.*\n"
+            "      - path: /opt/conda/bin/python3\n"
+            "      - path: /opt/conda/bin/python3.*\n"
         )
     policy_yaml = ""
     if network_policies:
@@ -2915,8 +3266,8 @@ def _install_pinned_openshell_wrapper(
             "  read_write:\n"
             "    - /tmp\n"
             "    - /dev/null\n"
-            "    - /sandbox\n"
             "    - /sandbox/.openshell/workspace\n"
+            "    - /sandbox/openclaw\n"
             "landlock:\n"
             "  compatibility: best_effort\n"
             "network_policies:\n"
@@ -2927,7 +3278,13 @@ def _install_pinned_openshell_wrapper(
     # effective driver configuration in the marker so a reused deployment is
     # refreshed when its node, workspace, PVC, policy, or endpoint changes.
     wrapper_fingerprint = hashlib.sha256(
-        "\n".join((driver_config_json, policy_yaml, gateway_endpoint or "", sandbox_image or "")).encode()
+        "\n".join((
+            driver_config_json,
+            policy_yaml,
+            gateway_endpoint or "",
+            sandbox_image or "",
+            sandbox_cpu_limit or "",
+        )).encode()
     ).hexdigest()[:12]
     # Bump the marker whenever wrapper semantics change so a reused agent
     # cannot retain an older wrapper that would duplicate an existing --from
@@ -2938,7 +3295,21 @@ def _install_pinned_openshell_wrapper(
     # calls fail with exit 127.  Keep the experiment-owned sandbox alive until
     # the OpenClaw agent is finished; this is limited to the generated wrapper
     # and does not modify the gateway or any cluster infrastructure.
-    marker = f"# trace-replay-openshell-node-selector-v19-{wrapper_fingerprint}"
+    # v27 installs a pinned OpenSSH client in the experiment pod. OpenClaw's
+    # OpenShell backend uses the OpenShell SSH proxy for remote commands and
+    # workspace transfers; replacing the SSH client with a `sandbox exec`
+    # shim breaks that protocol.
+    # v29 forces OpenShell sandbox creation to detach. The pinned CLI supports
+    # `--detach`, but the OpenClaw plugin's capability check can miss it and
+    # otherwise wait forever while attached to its persistent main process.
+    # Keep `sleep infinity` as that process; later tool commands use separate
+    # SSH execution channels.
+    # v24 mounts its remote roots on writable, experiment-owned PVC storage,
+    # separate from the staged SWE repository.
+    # v30 makes file uploads copy into the destination directory (0.0.116
+    # otherwise replaces a directory with the uploaded file, corrupting the
+    # OpenClaw workspace seed).
+    marker = f"# trace-replay-openshell-node-selector-v30-{wrapper_fingerprint}"
     policy_injection = ""
     if policy_yaml:
         policy_injection = (
@@ -2953,6 +3324,15 @@ def _install_pinned_openshell_wrapper(
         "const fs = require('fs');\n",
         "const args = process.argv.slice(2);\n",
         "const sandboxIndex = args.indexOf('sandbox');\n",
+        "const workspace = process.env.OPENSHELL_FLEET_WORKSPACE || process.env.OPENSHELL_WORKSPACE || 'aharush-default';\n",
+        "const safeWorkspace = workspace.replace(/[^A-Za-z0-9-]/g, '-');\n",
+        "const sandboxName = safeWorkspace.startsWith('aharush-') ? safeWorkspace.slice(0, 19) : ('aharush-' + safeWorkspace).slice(0, 19);\n",
+        # OpenClaw's upstream backend calls `get` before `create`, then uses
+        # the same runtime name for `ssh-config`. Keep these names aligned
+        # with the experiment's Kubernetes-safe shortened create name.
+        "if (sandboxIndex >= 0 && ['get', 'ssh-config'].includes(args[sandboxIndex + 1]) && args[sandboxIndex + 2]) {\n",
+        "  args[sandboxIndex + 2] = sandboxName;\n",
+        "}\n",
         # The OpenClaw plugin may already add a driver-config-json argument
         # (for example, its own node selector).  That argument must not mask
         # the experiment's storage wiring: on this cluster the default
@@ -2962,13 +3342,19 @@ def _install_pinned_openshell_wrapper(
         # node/PVC/policy configuration deterministically.
         "if (sandboxIndex >= 0 && args[sandboxIndex + 1] === 'create') {\n",
         f"  const sandboxImage = {json.dumps(sandbox_image)};\n",
+        f"  const sandboxCpu = {json.dumps(sandbox_cpu_limit)};\n",
         f"  const injected = ['--driver-config-json', {json.dumps(driver_config_json)}];\n",
         "  for (let i = args.length - 1; i >= 0; i--) {\n",
         "    if (args[i] === '--driver-config-json') { args.splice(i, 2); continue; }\n",
         "    if (args[i].startsWith('--driver-config-json=')) { args.splice(i, 1); }\n",
         "    if (args[i] === '--policy') { args.splice(i, 2); continue; }\n",
         "    if (args[i].startsWith('--policy=')) { args.splice(i, 1); }\n",
+        "    if (args[i] === '--name') { args.splice(i, 2); continue; }\n",
+        "    if (args[i].startsWith('--name=')) { args.splice(i, 1); }\n",
+        "    if (args[i] === '--cpu') { args.splice(i, 2); continue; }\n",
+        "    if (args[i].startsWith('--cpu=')) { args.splice(i, 1); }\n",
         "  }\n",
+        "  injected.unshift('--name', sandboxName);\n",
         "  if (sandboxImage) {\n",
         "    const fromIndex = args.indexOf('--from');\n",
         "    const fromEqualsIndex = args.findIndex((arg) => arg.startsWith('--from='));\n",
@@ -2976,19 +3362,48 @@ def _install_pinned_openshell_wrapper(
         "    else if (fromEqualsIndex >= 0) args[fromEqualsIndex] = '--from=' + sandboxImage;\n",
         "    else injected.unshift('--from', sandboxImage);\n",
         "  }\n",
+        "  if (sandboxCpu) injected.push('--cpu', sandboxCpu);\n",
         policy_injection,
         "  args.splice(sandboxIndex + 2, 0, ...injected);\n",
 "}\n",
+        # OpenClaw seeds its remote workspace through `sandbox upload` using
+        # the plugin's full runtime name. Match it to the shortened run name.
+        "if (sandboxIndex >= 0 && args[sandboxIndex + 1] === 'upload' && args[sandboxIndex + 3]) {\n",
+        "  args[sandboxIndex + 3] = sandboxName;\n",
+        "  // CLI 0.0.116 treats the remote argument as an exact destination path,\n",
+        "  // so uploading a single file replaces an existing directory with that\n",
+        "  // file.  The plugin uploads each workspace entry separately and expects\n",
+        "  // copy-into-directory semantics; normalize file sources to\n",
+        "  // <dest>/<basename> so workspace seeding cannot clobber the seed roots.\n",
+        "  const uploadRemote = args[args.length - 1];\n",
+        "  const uploadLocal = args[args.length - 2];\n",
+        "  if (uploadRemote && uploadLocal && !uploadRemote.startsWith('-')) {\n",
+        "    let uploadIsFile = false;\n",
+        "    try { uploadIsFile = fs.lstatSync(uploadLocal).isFile(); } catch (err) { uploadIsFile = false; }\n",
+        "    const uploadBase = uploadLocal.replace(/\\/+$/, '').split('/').pop();\n",
+        "    const uploadRemoteBase = uploadRemote.replace(/\\/+$/, '').split('/').pop();\n",
+        "    if (uploadIsFile && uploadBase && uploadBase !== uploadRemoteBase) {\n",
+        "      args[args.length - 1] = uploadRemote.replace(/\\/+$/, '') + '/' + uploadBase;\n",
+        "    }\n",
+        "  }\n",
+        "}\n",
         "if (sandboxIndex >= 0 && args[sandboxIndex + 1] === 'exec') {\n",
         "  for (let i = args.length - 1; i >= 0; i--) {\n",
+        "    if (args[i] === '--name' && i + 1 < args.length) { args[i + 1] = sandboxName; continue; }\n",
+        "    if (args[i].startsWith('--name=')) { args[i] = '--name=' + sandboxName; continue; }\n",
         "    if (args[i] === '--policy') { args.splice(i, 2); continue; }\n",
         "    if (args[i].startsWith('--policy=')) { args.splice(i, 1); }\n",
         "  }\n",
         "}\n",
         "if (sandboxIndex >= 0 && args[sandboxIndex + 1] === 'create') {\n",
-        "  const separator = args.indexOf('--', sandboxIndex + 2);\n",
+        "  let separator = args.indexOf('--', sandboxIndex + 2);\n",
         "  if (separator >= 0 && args[separator + 1] === 'true') {\n",
         "    args.splice(separator + 1, 1, 'sh', '-c', 'exec sleep 2147483647');\n",
+        "    separator = args.indexOf('--', sandboxIndex + 2);\n",
+        "  }\n",
+        "  if (!args.includes('--detach')) {\n",
+        "    if (separator >= 0) args.splice(separator, 0, '--detach');\n",
+        "    else args.push('--detach');\n",
         "  }\n",
         "}\n",
         "const result = spawnSync('/opt/openshell/bin/openshell', args, { stdio: 'inherit' });\n",
@@ -2996,75 +3411,48 @@ def _install_pinned_openshell_wrapper(
         "TRACE_REPLAY_OPEN_SHELL_WRAPPER\n",
         "              chmod 755 /opt/openshell/bin/openshell-pinned\n",
     ])
-    # The published OpenClaw/OpenShell image contains the OpenShell CLI but
-    # not an OpenSSH client.  The OpenShell backend invokes `ssh` for the
-    # sandbox transport, so provide a tiny experiment-scoped compatibility
-    # wrapper in the existing shared CLI volume.  It translates the plugin's
-    # SSH invocation to the supported `openshell sandbox exec` RPC and avoids
-    # changing the base image or installing packages in every gateway.
-    ssh_wrapper = """#!/bin/sh
-cfg=""
-mode="--no-tty"
-log=/tmp/trace-replay-ssh-wrapper.log
-printf 'ssh-wrapper args:' >> "$log"
-for arg in "$@"; do printf ' <%s>' "$arg" >> "$log"; done
-printf '\\n' >> "$log"
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -F) cfg="$2"; shift 2 ;;
-    -tt|-t) mode="--tty"; shift ;;
-    -T) mode="--no-tty"; shift ;;
-    -o) shift 2 ;;
-    --) shift; break ;;
-    *) host="$1"; shift; break ;;
-  esac
-done
-name=$(sed -n 's/.*--name \\([^ ]*\\).*/\\1/p' "$cfg" | head -1)
-workspace=$(sed -n 's/.*--workspace \\([^ ]*\\).*/\\1/p' "$cfg" | head -1)
-[ -n "$workspace" ] || workspace=${OPENSHELL_WORKSPACE:-default}
-# ProxyCommand uploads have no -F config. Resolve the active sandbox in this agent workspace.
-if [ -z "$name" ]; then
-  name=$(/opt/openshell/bin/openshell sandbox list ${OPENSHELL_GATEWAY_ENDPOINT:+--gateway-endpoint "$OPENSHELL_GATEWAY_ENDPOINT"} 2>/dev/null | awk 'NR==3 {print $1}')
-fi
-[ -n "$name" ] || { echo "ssh wrapper: missing sandbox name" >&2; exit 2; }
-remote="$*"
-printf 'ssh-wrapper cfg=%s name=%s workspace=%s mode=%s remote=%s\\n' "$cfg" "$name" "$workspace" "$mode" "$remote" >> "$log"
-output=$(mktemp /tmp/trace-replay-ssh-output.XXXXXX)
-# OpenClaw keeps the SSH stdin pipe open for ordinary exec calls.  The
-# OpenShell CLI treats that as command stdin and waits for EOF, so close it for
-# normal commands.  The initial workspace upload is the one exception: its
-# `cat | tar xf -` command legitimately consumes the SSH stream.
-case "$remote" in
-  *"cat | tar xf -"*)
-    /opt/openshell/bin/openshell sandbox exec --gateway openshell --workspace "$workspace" --name "$name" "$mode" -- /bin/sh -lc "$remote" > "$output" 2>&1
-    ;;
-  *)
-    /opt/openshell/bin/openshell sandbox exec --gateway openshell --workspace "$workspace" --name "$name" "$mode" -- /bin/sh -lc "$remote" > "$output" 2>&1 </dev/null
-    ;;
-esac
-rc=$?
-printf 'ssh-wrapper rc=%s output-begin\\n' "$rc" >> "$log"
-tail -c 4096 "$output" >> "$log"
-printf '\\nssh-wrapper output-end\\n' >> "$log"
-cat "$output"
-rm -f "$output"
-exit "$rc"
+    # Install the real SSH client into the existing per-pod OpenShell CLI
+    # volume. The base OpenClaw image is Debian 12 and already contains the
+    # client's shared-library dependencies. Pin and verify the Debian package
+    # so this run does not rely on a mutable image push or an unpinned package.
+    ssh_install_script = """set -eu
+tmp=/tmp/aharush-openssh-client
+mkdir -p "$tmp/lists/partial" "$tmp/cache/archives/partial" "$tmp/pkg" "$tmp/root"
+timeout 120s apt-get -o Dir::State::lists="$tmp/lists" -o Dir::Cache="$tmp/cache" -o APT::Get::List-Cleanup=0 update
+(cd "$tmp/pkg" && timeout 60s apt-get -o Dir::State::lists="$tmp/lists" -o Dir::Cache="$tmp/cache" download 'openssh-client=1:9.2p1-2+deb12u10')
+pkg=$(find "$tmp/pkg" -maxdepth 1 -type f -name 'openssh-client_*.deb' -print -quit)
+test -n "$pkg"
+printf '%s  %s\\n' '42c250b8b9110382488c53c066a960bc564ddac2cb9e449f47b6cdbb5fc1cb60' "$pkg" | sha256sum -c -
+dpkg-deb -x "$pkg" "$tmp/root"
+cp "$tmp/root/usr/bin/ssh" /opt/openshell/bin/ssh
+chmod 755 /opt/openshell/bin/ssh
+/opt/openshell/bin/ssh -V
 """
-    ssh_wrapper_b64 = base64.b64encode(ssh_wrapper.encode()).decode()
     init_containers = deployment["spec"]["template"]["spec"].setdefault("initContainers", [])
-    init_containers[:] = [item for item in init_containers if item.get("name") != "install-ssh-wrapper"]
+    init_containers[:] = [
+        item for item in init_containers
+        if item.get("name") not in {
+            "install-ssh-wrapper",
+            "install-openssh-client",
+            "aharush-install-openssh-client",
+        }
+    ]
     init_containers.append({
-        "name": "install-ssh-wrapper",
-        "image": "python:3.12-slim",
-        "command": ["python3", "-c"],
-        "args": [
-            "import base64, os; "
-            f"p='/opt/openshell/bin/ssh'; open(p, 'wb').write(base64.b64decode({ssh_wrapper_b64!r})); os.chmod(p, 0o755)"
-        ],
+        "name": "aharush-install-openssh-client",
+        "image": EXPERIMENT_OPENCLAW_IMAGE,
+        "command": ["/bin/sh", "-lc"],
+        "args": [ssh_install_script],
         "volumeMounts": [{"mountPath": "/opt/openshell", "name": "openshell-cli"}],
     })
+    startup_changed = False
     if gateway_endpoint:
         endpoint_literal = json.dumps(gateway_endpoint)
+        endpoint_cert_key = re.sub(r"[^A-Za-z0-9._-]", "_", gateway_endpoint)
+        endpoint_cert_dir = f"/home/node/.config/openshell/gateways/{endpoint_cert_key}/mtls"
+        endpoint_cert_marker = (
+            "# trace-replay-openshell-endpoint-certs-v2-"
+            + hashlib.sha256(gateway_endpoint.encode("utf-8")).hexdigest()[:10]
+        )
     for container in deployment["spec"]["template"]["spec"].get("containers", []):
         if container.get("name") == "gateway":
             env = container.setdefault("env", [])
@@ -3078,22 +3466,105 @@ exit "$rc"
                 env.append({"name": "OPENSHELL_WORKSPACE", "value": workspace})
             else:
                 workspace_env["value"] = workspace
+            if gateway_endpoint:
+                gateway_endpoint_env = next((item for item in env if item.get("name") == "OPENSHELL_GATEWAY_ENDPOINT"), None)
+                if gateway_endpoint_env is None:
+                    env.append({"name": "OPENSHELL_GATEWAY_ENDPOINT", "value": gateway_endpoint})
+                else:
+                    gateway_endpoint_env["value"] = gateway_endpoint
+        if container.get("name") != "gateway":
+            continue
         for index, arg in enumerate(container.get("args", [])):
-                if "EP=" in arg and "openshell" in arg:
-                    container["args"][index] = re.sub(
-                        r'EP=\\?"[^"\n]+\\?"',
-                        f"EP={endpoint_literal}",
-                        arg,
+            if not isinstance(arg, str) or "openshell" not in arg:
+                continue
+            updated_arg = arg
+            if gateway_endpoint and "EP=" in updated_arg:
+                updated_arg = re.sub(
+                    r'EP=\\?"[^"\n]+\\?"',
+                    f"EP={endpoint_literal}",
+                    updated_arg,
+                    count=1,
+                )
+            if (
+                gateway_endpoint
+                and endpoint_cert_marker not in updated_arg
+                and "trace-replay-openshell-mtls-endpoint-dir-v1" not in updated_arg
+            ):
+                mtls_setup = "\n".join([
+                    endpoint_cert_marker,
+                    f'mkdir -p "{endpoint_cert_dir}"',
+                    f'cp /openshell-mtls/ca.crt /openshell-mtls/tls.crt /openshell-mtls/tls.key "{endpoint_cert_dir}/"',
+                    f'chmod 600 "{endpoint_cert_dir}/tls.key"',
+                ])
+                # Older OpenShell-enabled agent deployments materialize a
+                # gateway alias directly instead of assigning `EP` and using
+                # `gateway add`.  Put a second copy of the mTLS bundle at the
+                # CLI's URL-derived location in either form.
+                ep_pattern = re.compile(r'(?m)^([ \t]*EP=\\?"[^"\n]+\\?"[ \t]*)$')
+                if ep_pattern.search(updated_arg):
+                    updated_arg, injected = ep_pattern.subn(
+                        lambda match: match.group(1) + "\n" + mtls_setup,
+                        updated_arg,
                         count=1,
                     )
-                    break
+                else:
+                    alias_chmod = re.compile(
+                        r'(?m)^([ \t]*chmod 600 /home/node/\.config/openshell/gateways/openshell/mtls/tls\.key[ \t]*)$'
+                    )
+                    updated_arg, injected = alias_chmod.subn(
+                        lambda match: match.group(1) + "\n" + mtls_setup,
+                        updated_arg,
+                        count=1,
+                    )
+                if not injected:
+                    raise RuntimeError(
+                        "OpenClaw gateway command has neither an endpoint assignment nor the expected mTLS alias setup"
+                    )
+            if gateway_endpoint:
+                # The plugin addresses the gateway by name (`--gateway <name>`),
+                # and the CLI only builds an SSH proxy for a registered name.
+                # Register this run's endpoint before OpenClaw starts so
+                # workspace seeding (SSH upload) can resolve the gateway.
+                registry_marker = (
+                    "# trace-replay-openshell-gateway-registry-v1-"
+                    + OPENSHELL_GATEWAY_NAME
+                )
+                if registry_marker not in updated_arg:
+                    registry_line = " ".join([
+                        "timeout 30s /opt/openshell/bin/openshell gateway add",
+                        f"--name {shlex.quote(OPENSHELL_GATEWAY_NAME)}",
+                        shlex.quote(gateway_endpoint),
+                        ">/dev/null 2>&1",
+                        "|| /opt/openshell/bin/openshell gateway list 2>/dev/null",
+                        f"| grep -q {shlex.quote(OPENSHELL_GATEWAY_NAME)}",
+                    ])
+                    updated_arg, injected_registry = re.subn(
+                        r"(?m)^(exec )",
+                        registry_marker + "\n" + registry_line + "\n" + r"\1",
+                        updated_arg,
+                        count=1,
+                    )
+                    if not injected_registry:
+                        raise RuntimeError(
+                            "OpenClaw gateway command has no exec line for gateway registration"
+                        )
+            startup_changed = startup_changed or updated_arg != arg
+            container["args"][index] = updated_arg
+            break
     for init_container in deployment["spec"]["template"]["spec"].get("initContainers", []):
         if init_container.get("name") != "init-config":
             continue
         args = init_container.setdefault("args", [""])
         if marker not in args[0]:
             args[0] += wrapper
-        return
+            # The wrapper marker includes a fingerprint of the effective
+            # driver config (including the shared PVC and subPath).  Report
+            # this change so callers that reuse an existing Deployment roll
+            # its pod before sending sandbox-create requests; otherwise the
+            # Deployment template is updated but the old pod keeps using its
+            # previous wrapper.
+            startup_changed = True
+        return startup_changed
     raise RuntimeError("base OpenClaw deployment has no init-config container")
 
 
@@ -3105,14 +3576,14 @@ def ensure_driver_config(cluster: Cluster) -> None:
     A small source archive keeps the job reproducible without requiring an
     image build or a registry push.
     """
-    name = "trace-replay-experiment-driver"
+    name = f"{RESOURCE_PREFIX}-experiment-driver"
     bundle = io.BytesIO()
     package_root = ROOT / "src/trace_replay_sim"
     with tarfile.open(fileobj=bundle, mode="w:gz") as archive:
         archive.add(ROOT / "src/trace_replay_sim/driver.py", arcname="driver.py")
         for source in sorted(package_root.rglob("*.py")):
             archive.add(source, arcname=str(Path("trace_replay_sim") / source.relative_to(package_root)))
-    cluster.upsert_owned_configmap("trace-replay", {
+    cluster.upsert_owned_configmap(cluster.namespace, {
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {"name": name, "labels": {"managed-by": "trace-replay-experiment"}},
@@ -3127,7 +3598,7 @@ def ensure_mock_llm_config(cluster: Cluster, replay_corpus: Path, system_ns: str
     # another's mock corpus and Deployment.
     token = safe_name(run_token).strip("-")
     token = f"{token[:14].rstrip('-')}-{token[-8:]}" if len(token) > 8 else token
-    prefix = f"trace-replay-{token}"
+    prefix = f"{RESOURCE_PREFIX}-{token}"
     service_name = f"{prefix}-mock-llm"
     source_name = f"{prefix}-mock-src"
     replay_payload = json.loads(replay_corpus.read_text(encoding="utf-8"))
@@ -3193,7 +3664,7 @@ def ensure_mock_llm_config(cluster: Cluster, replay_corpus: Path, system_ns: str
         env.update({
             "REPLAY_CORPUS": "/data/corpus",
             "MOCK_EDGES_PATH": "/edges/mock_edges.jsonl",
-            "OTLP_ENDPOINT": f"http://{BASE_JAEGER}.trace-replay.svc.cluster.local:4318",
+            "OTLP_ENDPOINT": f"http://{BASE_JAEGER}.{system_ns}.svc.cluster.local:4318",
         })
         container["env"] = [{"name": name, "value": value} for name, value in env.items()]
         mounts = [mount for mount in container.get("volumeMounts", []) if mount.get("name") not in {"src", "corpus", "edges"}]
@@ -3299,6 +3770,7 @@ def _workload_command(
     name: str,
     arguments: dict[str, Any],
     endpoint: str,
+    recorded_result_bytes: int | None = None,
 ) -> list[str]:
     """Build a sandbox command for a workload-specific internal API.
 
@@ -3307,7 +3779,7 @@ def _workload_command(
     is embedded in the command, so a successful run proves that the selected
     backend, rather than the LLM simulator, produced the tool response.
     """
-    payload = base64.b64encode(json.dumps({
+    request = {
         "session_id": session_id,
         "workload": workload,
         "benchmark": benchmark,
@@ -3315,7 +3787,14 @@ def _workload_command(
         "call": call,
         "tool": name,
         "arguments": arguments,
-    }, separators=(",", ":")).encode()).decode()
+    }
+    if (
+        workload == "research_deep_search"
+        and recorded_result_bytes is not None
+        and (name.endswith("__search") or name.endswith("__get_document"))
+    ):
+        request["recorded_result_bytes"] = recorded_result_bytes
+    payload = base64.b64encode(json.dumps(request, separators=(",", ":")).encode()).decode()
     endpoint_literal = json.dumps(endpoint.rstrip("/"))
     code = (
         "import base64,json,os,sys,urllib.request,urllib.error;"
@@ -3349,6 +3828,8 @@ def _swe_sandbox_command(
     arguments: dict[str, Any],
     endpoint: str,
     task: SweTask,
+    tool_cpu_ids: tuple[int, ...] = (),
+    tool_cgroup_quota: str = "",
 ) -> list[str]:
     """Execute the recorded SWE command in the real task-image sandbox.
 
@@ -3365,10 +3846,12 @@ def _swe_sandbox_command(
         "tool": name,
         "arguments": arguments,
         "swe_task": task.public_dict(),
+        "tool_cpu_ids": list(tool_cpu_ids),
+        "tool_cgroup_quota": tool_cgroup_quota,
     }, separators=(",", ":")).encode()).decode()
     endpoint_literal = json.dumps(endpoint.rstrip("/"))
     code = (
-        "import base64,glob,json,os,subprocess,sys,urllib.request,urllib.error;"
+        "import base64,glob,json,os,resource,subprocess,sys,time,urllib.request,urllib.error;"
         f"p=json.loads(base64.b64decode('{payload}'));"
         "a=p.get('arguments') or {};task=p.get('swe_task') or {};tool_name=str(p.get('tool') or '');"
         "command=str(a.get('command') or a.get('cmd') or '');"
@@ -3382,7 +3865,81 @@ def _swe_sandbox_command(
         " head=subprocess.run(['git','-C',cwd,'rev-parse','HEAD'],capture_output=True,text=True,timeout=20,check=False)\n"
         " if head.returncode != 0 or head.stdout.strip() != str(task.get('base_commit')):\n  raise RuntimeError('SWE task image commit mismatch: expected '+str(task.get('base_commit'))+' observed '+head.stdout.strip())\n"
         " verified_base_commit=head.stdout.strip()\n"
-        " if command:\n  command=command.replace('/testbed',repo_root)\n  completed=subprocess.run(['bash','-lc',command],cwd=cwd,capture_output=True,text=True,timeout=180,check=False)\n  result={'output':(completed.stdout+completed.stderr)[-64000:],'returncode':completed.returncode,'operation':'command'}\n"
+        " if command:\n"
+        "  command=command.replace('/testbed',repo_root)\n"
+        "  requested=set(int(cpu) for cpu in p.get('tool_cpu_ids') or [])\n"
+        "  original=os.sched_getaffinity(0)\n"
+        "  if requested and not requested.issubset(original):\n"
+        "   raise RuntimeError('requested tool CPUs are outside sandbox effective affinity')\n"
+        "  if requested: os.sched_setaffinity(0,requested)\n"
+        "  effective=sorted(os.sched_getaffinity(0))\n"
+        "  quota=str(p.get('tool_cgroup_quota') or '').strip()\n"
+        "  cg_rel=''\n"
+        "  try:\n"
+        "   for cg_line in open('/proc/self/cgroup'):\n"
+        "    cg_parts=cg_line.rstrip().split(':',2)\n"
+        "    if len(cg_parts)==3 and cg_parts[1]=='': cg_rel=cg_parts[2]\n"
+        "  except OSError: cg_rel=''\n"
+        "  cg_dir=os.path.join('/sys/fs/cgroup',cg_rel.lstrip('/')) if cg_rel not in ('','/') else '/sys/fs/cgroup'\n"
+        "  def _cg_stat():\n"
+        "   values={}\n"
+        "   try:\n"
+        "    for cg_line in open(os.path.join(cg_dir,'cpu.stat')):\n"
+        "     cg_parts=cg_line.split()\n"
+        "     if len(cg_parts)>=2:\n"
+        "      try: values[cg_parts[0]]=int(cg_parts[1])\n"
+        "      except ValueError: pass\n"
+        "   except OSError: pass\n"
+        "   for cg_kind in ('some','full'):\n"
+        "    try:\n"
+        "     for cg_line in open(os.path.join(cg_dir,'cpu.pressure')):\n"
+        "      cg_parts=cg_line.split()\n"
+        "      if cg_parts and cg_parts[0]==cg_kind:\n"
+        "       for cg_token in cg_parts[1:]:\n"
+        "        cg_key,_,cg_value=cg_token.partition('=')\n"
+        "        if cg_value:\n"
+        "         try: values['pressure_'+cg_kind+'_'+cg_key]=float(cg_value)\n"
+        "         except ValueError: pass\n"
+        "    except OSError: pass\n"
+        "   return values\n"
+        # Projected processes in the sandbox usually run as a non-root SSH
+        # user, so they cannot read the pod cgroup even when root can.  The
+        # sandbox CPU limit is applied at pod creation and verified by the
+        # root-owned sampler, not from inside the tool process.
+        "  quota_original=None;quota_applied=None\n"
+        "  before_cg=_cg_stat()\n"
+        "  try:\n"
+        "   before=resource.getrusage(resource.RUSAGE_CHILDREN)\n"
+        "   started_epoch_ns=time.time_ns();started_ns=time.monotonic_ns()\n"
+        "   completed=subprocess.run(['bash','-lc',command],cwd=cwd,capture_output=True,text=True,timeout=180,check=False)\n"
+        "   ended_ns=time.monotonic_ns();ended_epoch_ns=time.time_ns()\n"
+        "   after=resource.getrusage(resource.RUSAGE_CHILDREN)\n"
+        "  finally:\n"
+        "   after_cg=_cg_stat()\n"
+        "   if requested: os.sched_setaffinity(0,original)\n"
+        "  def _cg_delta(key):\n"
+        "   if key in before_cg and key in after_cg: return after_cg[key]-before_cg[key]\n"
+        "   return None\n"
+        "  result={'output':(completed.stdout+completed.stderr)[-64000:],'returncode':completed.returncode,'operation':'command',"
+        "'command_started_epoch_ns':started_epoch_ns,'command_ended_epoch_ns':ended_epoch_ns,"
+        "'command_wall_ns':ended_ns-started_ns,'command_user_cpu_us':round((after.ru_utime-before.ru_utime)*1000000),"
+        "'command_system_cpu_us':round((after.ru_stime-before.ru_stime)*1000000),"
+        "'command_voluntary_context_switches':after.ru_nvcsw-before.ru_nvcsw,"
+        "'command_involuntary_context_switches':after.ru_nivcsw-before.ru_nivcsw,"
+        "'command_minor_faults':after.ru_minflt-before.ru_minflt,"
+        "'command_major_faults':after.ru_majflt-before.ru_majflt,"
+        "'command_effective_cpu_ids':effective,'command_requested_cpu_ids':sorted(requested),"
+        "'command_cgroup_quota_requested':quota,'command_cgroup_quota_applied':quota_applied,"
+        "'command_cgroup_quota_original':quota_original,"
+        "'command_cgroup_usage_usec':_cg_delta('usage_usec'),"
+        "'command_cgroup_user_usec':_cg_delta('user_usec'),"
+        "'command_cgroup_system_usec':_cg_delta('system_usec'),"
+        "'command_cgroup_nr_throttled':_cg_delta('nr_throttled'),"
+        "'command_cgroup_throttled_usec':_cg_delta('throttled_usec'),"
+        "'command_cgroup_pressure_some_usec':_cg_delta('pressure_some_total'),"
+        "'command_cgroup_pressure_full_usec':_cg_delta('pressure_full_total'),"
+        "'command_cgroup_pressure_some_avg10':after_cg.get('pressure_some_avg10'),"
+        "'command_cgroup_pressure_full_avg10':after_cg.get('pressure_full_avg10')}\n"
         " elif tool_name in ('Read','ReadMcpResourceTool'):\n  path=str(a.get('file_path') or a.get('path') or a.get('uri') or '')\n  path=path[7:] if path.startswith('file://') else path\n  path=path.replace('/testbed',repo_root,1)\n  if not (path == repo_root or path.startswith(repo_root+'/')):\n   raise RuntimeError('SWE read path is outside the staged repository')\n  with open(path,encoding='utf-8',errors='replace') as handle: result={'output':handle.read()[-64000:],'returncode':0,'operation':'read'}\n"
         " elif tool_name in ('Edit','Write'):\n  path=str(a.get('file_path') or a.get('path') or '')\n  path=path.replace('/testbed',repo_root,1)\n  if not (path == repo_root or path.startswith(repo_root+'/')):\n   raise RuntimeError('SWE write path is outside the staged repository')\n  if tool_name == 'Edit':\n   with open(path,encoding='utf-8') as handle: text=handle.read()\n   old=str(a.get('old_string') or ''); new=str(a.get('new_string') or '')\n   if not old or old not in text: raise RuntimeError('SWE edit target was not found')\n   with open(path,'w',encoding='utf-8') as handle: handle.write(text.replace(old,new,1))\n  else:\n   os.makedirs(os.path.dirname(path) or repo_root,exist_ok=True)\n   with open(path,'w',encoding='utf-8') as handle: handle.write(str(a.get('content') or ''))\n  result={'output':'repository file updated','returncode':0,'operation':'write'}\n"
         " elif tool_name in ('Grep','Glob'):\n  base=str(a.get('path') or '/testbed')\n  base=base.replace('/testbed',repo_root,1)\n  if not (base == repo_root or base.startswith(repo_root+'/')): raise RuntimeError('SWE search path is outside the staged repository')\n  if tool_name == 'Glob':\n   pattern=str(a.get('pattern') or '**/*'); result={'output':'\\n'.join(glob.glob(os.path.join(base,pattern),recursive=True))[-64000:],'returncode':0,'operation':'search'}\n  else:\n   pattern=str(a.get('pattern') or ''); found=subprocess.run(['grep','-R','-n','--',pattern,base],cwd=cwd,capture_output=True,text=True,timeout=60,check=False); result={'output':(found.stdout+found.stderr)[-64000:],'returncode':found.returncode,'operation':'search'}\n"
@@ -3409,6 +3966,8 @@ def prepare_workload_corpus(
     backends: dict[str, Any],
     swe_manifest: dict[str, SweTask] | None = None,
     selected_session_ids: set[str] | None = None,
+    tool_cpu_ids: tuple[int, ...] = (),
+    tool_cgroup_quota: str = "",
 ) -> Path:
     """Map selected trace tools to the resolved backend API boundaries."""
     payload = json.loads(source.read_text(encoding="utf-8"))
@@ -3464,6 +4023,8 @@ def prepare_workload_corpus(
                         arguments,
                         spec.base_url,
                         swe_manifest[session_id],
+                        tool_cpu_ids,
+                        tool_cgroup_quota,
                     )
                     mapped[workload] += 1
                 elif workload != "personal_assistant":
@@ -3477,6 +4038,8 @@ def prepare_workload_corpus(
                         name,
                         arguments,
                         spec.base_url,
+                        len(tool["recorded_result"].encode("utf-8"))
+                        if isinstance(tool.get("recorded_result"), str) else None,
                     )
                     mapped[workload] += 1
     present_workloads = {
@@ -3680,14 +4243,14 @@ def create_trace_job(
     trace_dir.mkdir(parents=True, exist_ok=True)
     corpus_path = trace_dir / "input_corpus.json"
     corpus_path.write_text(json.dumps({"dataset": "Exgentic/agent-llm-traces", "sessions": [item["session"]]}, indent=2))
-    cm = f"trace-replay-{run_id}-corpus-{workload[:20]}-{index:03d}"
-    job = f"trace-replay-{run_id}-trace-{workload[:20]}-{index:03d}" + (f"-r{attempt}" if attempt else "")
+    cm = f"{RESOURCE_PREFIX}-{run_id}-corpus-{workload[:20]}-{index:03d}"
+    job = f"{RESOURCE_PREFIX}-{run_id}-trace-{workload[:20]}-{index:03d}" + (f"-r{attempt}" if attempt else "")
     if prewarm_only:
         # Prewarm Jobs are short-lived control traffic; keep their resource
         # names well below Kubernetes' 63-character name/label limit even
         # when the workload name is long.
-        cm = f"trace-replay-swp-cm-{run_id}-{index:03d}"[:63].rstrip("-")
-        job = f"trace-replay-swp-{run_id}-{index:03d}"[:63].rstrip("-")
+        cm = f"{RESOURCE_PREFIX}-swp-cm-{run_id}-{index:03d}"[:63].rstrip("-")
+        job = f"{RESOURCE_PREFIX}-swp-{run_id}-{index:03d}"[:63].rstrip("-")
     cluster.upsert_owned_configmap(cluster.namespace, {
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -3696,7 +4259,7 @@ def create_trace_job(
             "labels": {
                 "managed-by": "trace-replay-experiment",
                 "component": "trace-corpus",
-                "run": f"trace-replay-{run_id}",
+                "run": f"{RESOURCE_PREFIX}-{run_id}",
                 "workload": workload,
             },
         },
@@ -3746,7 +4309,7 @@ def create_trace_job(
             "args": ["while [ ! -f /results/.trace-replay-collector-done ]; do sleep 1; done"],
             "volumeMounts": [{"name": "results", "mountPath": "/results"}],
         }],
-        "volumes": [{"name": "source", "configMap": {"name": "trace-replay-experiment-driver"}}, {"name": "driver-app", "emptyDir": {}}, {"name": "corpus", "configMap": {"name": cm}}, {"name": "results", "emptyDir": {}}],
+        "volumes": [{"name": "source", "configMap": {"name": f"{RESOURCE_PREFIX}-experiment-driver"}}, {"name": "driver-app", "emptyDir": {}}, {"name": "corpus", "configMap": {"name": cm}}, {"name": "results", "emptyDir": {}}],
     }
     if prewarm_only:
         # The synthetic prewarm has no collector phase.  Let the Job finish
@@ -3765,7 +4328,7 @@ def create_trace_job(
         "app": "trace-replay-experiment",
         "component": "trace-job",
         "managed-by": "trace-replay-experiment",
-        "run": f"trace-replay-{run_id}",
+        "run": f"{RESOURCE_PREFIX}-{run_id}",
         "workload": workload,
         "trace-replay-warm-pool": "true" if warm_pool_size else "false",
         "trace-replay-warm-pool-slot": str(warm_pool_slot or 0),
@@ -3934,6 +4497,7 @@ def collect_trace(
     expected_node: str | None = None,
     jaeger_supplier: Any | None = None,
     jaeger_io_lock: threading.Lock | None = None,
+    expected_cgroup_quota: str = "",
 ) -> None:
     openclaw_pod = cluster.run(["-n", cluster.namespace, "get", "pod", "-l", f"app={agent}", "-o", "jsonpath={.items[0].metadata.name}"]).strip()
     openclaw_node = cluster.run(["-n", cluster.namespace, "get", "pod", openclaw_pod, "-o", "jsonpath={.spec.nodeName}"]).strip()
@@ -4103,12 +4667,12 @@ def collect_trace(
             watcher_stop.set()
             watcher.join(timeout=5)
             _stop_cgroup_samplers(samplers)
-            _merge_sandbox_cgroup_samples(cgroup_dir)
+            _merge_sandbox_cgroup_samples(cgroup_dir, expected_cgroup_quota)
     else:
         watcher_stop.set()
         watcher.join(timeout=5)
         _stop_cgroup_samplers(samplers)
-        _merge_sandbox_cgroup_samples(cgroup_dir)
+        _merge_sandbox_cgroup_samples(cgroup_dir, expected_cgroup_quota)
         ready_records = [record for record in lifecycle_records.values() if record.get("ready") and record.get("created_unix") and record.get("ready_unix")]
         driver_summary = {}
         try:
@@ -4643,6 +5207,14 @@ def main() -> int:
         help="client TLS Secret name in the OpenShell gateway namespace",
     )
     parser.add_argument(
+        "--openshell-client-secret-namespace",
+        default=os.environ.get("TRACE_REPLAY_OPENSHELL_CLIENT_SECRET_NAMESPACE"),
+        help=(
+            "namespace containing the source OpenShell client Secret; defaults to "
+            "--openshell-namespace"
+        ),
+    )
+    parser.add_argument(
         "--node",
         default=os.environ.get("TRACE_REPLAY_NODE"),
         help="backwards-compatible single target node",
@@ -4694,6 +5266,25 @@ def main() -> int:
     parser.add_argument("--retries", type=int, default=0)
     parser.add_argument("--simulated-ttft", type=float, default=None, help="simulated time-to-first-token in ms (overrides calibrated timing)")
     parser.add_argument("--simulated-itl", type=float, default=None, help="simulated inter-token latency in ms (overrides calibrated timing)")
+    parser.add_argument(
+        "--tool-cpu-ids",
+        default="",
+        help="comma-separated logical CPU IDs for SWE shell commands; empty leaves commands unrestricted",
+    )
+    parser.add_argument(
+        "--tool-cgroup-quota",
+        default="",
+        help=(
+            "CPU cores per sandbox (e.g. 0.5, 2), enforced as the sandbox pod "
+            "resources.limits.cpu at creation; empty leaves the limit unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--tool-cgroup-period-us",
+        type=int,
+        default=100_000,
+        help="cpu.max period used to derive the core count when --tool-cgroup-quota is set (default 100000)",
+    )
     parser.add_argument(
         "--execution-workers",
         type=int,
@@ -4748,6 +5339,29 @@ def main() -> int:
         workspace_pvcs = parse_workspace_pvcs(args.workspace_pvcs, target_nodes)
     except ValueError as exc:
         parser.error(str(exc))
+    if STRICT_OWNERSHIP:
+        allowed_node = os.environ.get("TRACE_REPLAY_ALLOWED_NODE", "").strip()
+        if RESOURCE_PREFIX != "aharush" or not allowed_node or target_nodes != (allowed_node,):
+            parser.error("strict ownership requires aharush names and exactly the approved target node")
+        if not OWNED_NAMESPACES or any(
+            not name.startswith("aharush-") and name != EXTERNAL_SANDBOX_NAMESPACE
+            for name in OWNED_NAMESPACES
+        ):
+            parser.error(
+                "strict ownership requires aharush-* namespaces, except for the explicitly configured "
+                "OpenShell sandbox namespace"
+            )
+        if EXTERNAL_SANDBOX_NAMESPACE and args.openshell_namespace != EXTERNAL_SANDBOX_NAMESPACE:
+            parser.error(
+                "strict ownership permits the external namespace only as --openshell-namespace"
+            )
+        if {args.namespace, args.system_namespace, args.openshell_namespace} - OWNED_NAMESPACES:
+            parser.error("strict ownership refuses a namespace outside TRACE_REPLAY_OWNED_NAMESPACES")
+        if args.allow_cross_node:
+            parser.error("strict ownership refuses --allow-cross-node")
+        for name in (args.workspace_pvc, *workspace_pvcs.values()):
+            if name and not name.startswith("aharush-"):
+                parser.error(f"strict ownership refuses non-aharush PVC name {name}")
     if len(target_nodes) > 1 and args.allow_cross_node:
         parser.error(
             "--allow-cross-node is incompatible with controlled multi-node placement; "
@@ -4763,6 +5377,26 @@ def main() -> int:
         parser.error("--execution-workers must be between 1 and --agents")
     if args.job_dispatch_interval < 0:
         parser.error("--job-dispatch-interval cannot be negative")
+    try:
+        tool_cpu_ids = tuple(int(value.strip()) for value in args.tool_cpu_ids.split(",") if value.strip())
+    except ValueError:
+        parser.error("--tool-cpu-ids requires comma-separated nonnegative integers")
+    if any(value < 0 for value in tool_cpu_ids) or len(tool_cpu_ids) != len(set(tool_cpu_ids)):
+        parser.error("--tool-cpu-ids requires unique nonnegative logical CPU IDs")
+    if args.tool_cgroup_quota.strip():
+        try:
+            tool_cgroup_quota = parse_tool_cgroup_quota(args.tool_cgroup_quota, args.tool_cgroup_period_us)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        tool_cgroup_quota = ""
+    if tool_cgroup_quota:
+        try:
+            sandbox_cpu_limit = tool_cgroup_quota_cpu_quantity(tool_cgroup_quota)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        sandbox_cpu_limit = None
     if not 1 <= args.cluster_api_workers <= 128:
         parser.error("--cluster-api-workers must be between 1 and 128")
     if args.cluster_retry_timeout < 0:
@@ -4858,6 +5492,11 @@ def main() -> int:
         )
         backends = load_backends(args.backend_manifest)
         validate_backends(backends, list(allocation))
+        if STRICT_OWNERSHIP:
+            for workload in allocation:
+                spec = backends[workload]
+                if spec.namespace not in OWNED_NAMESPACES or not spec.name.startswith("aharush-") or not spec.service.startswith("aharush-"):
+                    parser.error(f"strict ownership refuses backend {workload}: {spec.namespace}/{spec.name}")
         swe_manifest = (
             load_swe_manifest(args.swe_task_manifest)
             if allocation.get("software_engineering_qa", 0) > 0
@@ -4933,6 +5572,8 @@ def main() -> int:
             backends,
             swe_manifest,
             selected_session_ids=selected_ids,
+            tool_cpu_ids=tool_cpu_ids,
+            tool_cgroup_quota=tool_cgroup_quota,
         )
         queue = build_queue(
             corpus,
@@ -5241,14 +5882,18 @@ def main() -> int:
     ensure_driver_config(cluster)
     agent_client_secret = _ensure_openshell_client_secret(
         cluster,
-        args.openshell_namespace,
+        args.openshell_client_secret_namespace or args.openshell_namespace,
         args.openshell_client_secret,
-        f"trace-replay-openshell-client-tls-{run_hash}",
+        f"{RESOURCE_PREFIX}-openshell-client-tls-{run_hash}",
+        Path(__file__).resolve().parents[1] / "results" / "mlperf-cpu-20261111" / "oidc-private" / "access-token",
     )
-    # OpenClaw validates workspace names to a maximum of 19 characters.
-    # Use a run hash so a fresh run cannot reuse another experiment's
-    # workspace; `replay-<8 hex>-100` is exactly 19 characters.
-    workspace_prefix = args.reuse_existing_workspace_prefix or f"replay-{run_hash}"
+    # OpenShell limits workspace names to 19 characters.  In strict mode the
+    # workspace also prefixes the generated Sandbox resource, so retain the
+    # experiment owner's name while leaving room for agent slot 100.
+    default_workspace_prefix = (
+        f"{RESOURCE_PREFIX}-{run_hash[:7]}" if STRICT_OWNERSHIP else f"replay-{run_hash}"
+    )
+    workspace_prefix = args.reuse_existing_workspace_prefix or default_workspace_prefix
     agent_prefix = args.reuse_existing_agent_prefix or agent_name_prefix(args.out.name, run_hash)
     log_phase(f"deployment: workspace prefix={workspace_prefix} agent prefix={agent_prefix}")
     workspace_names = [workspace_name(workspace_prefix, index) for index in range(1, args.agents + 1)]
@@ -5261,7 +5906,7 @@ def main() -> int:
     if reuse_gateway_managed_workspaces:
         log_phase("storage: reusing gateway-managed OpenShell workspaces (no controller PVC)")
     elif args.workspace_access_mode == "ReadWriteMany":
-        shared_workspace_pvc = args.workspace_pvc or f"trace-replay-openshell-workspaces-{run_hash}"
+        shared_workspace_pvc = args.workspace_pvc or f"{RESOURCE_PREFIX}-openshell-workspaces-{run_hash}"
         ensure_shared_workspace(
             cluster,
             args.openshell_namespace,
@@ -5302,7 +5947,7 @@ def main() -> int:
         else:
             for node in target_nodes:
                 node_hash = hashlib.sha256(node.encode("utf-8")).hexdigest()[:6]
-                pvc_name = workspace_pvcs.get(node) or args.workspace_pvc or f"trace-replay-openshell-workspaces-{run_hash}-{node_hash}"
+                pvc_name = workspace_pvcs.get(node) or args.workspace_pvc or f"{RESOURCE_PREFIX}-openshell-workspaces-{run_hash}-{node_hash}"
                 node_workspaces = [
                     workspace_names[index - 1]
                     for index in node_groups[node]
@@ -5336,6 +5981,7 @@ def main() -> int:
             reuse_existing_workspaces=bool(args.reuse_existing_workspace_prefix),
             simulated_ttft_ms=args.simulated_ttft,
             simulated_itl_ms=args.simulated_itl,
+            sandbox_cpu_limit=sandbox_cpu_limit,
         )
     else:
         preferred_node = args.resume_preferred_node
@@ -5357,6 +6003,7 @@ def main() -> int:
                 agent_indices=resume_pending_indices,
                 simulated_ttft_ms=args.simulated_ttft,
                 simulated_itl_ms=args.simulated_itl,
+                sandbox_cpu_limit=sandbox_cpu_limit,
             )
         if resume_missing_indices:
             deploy_agents(
@@ -5376,6 +6023,7 @@ def main() -> int:
                 agent_indices=resume_missing_indices,
                 simulated_ttft_ms=args.simulated_ttft,
                 simulated_itl_ms=args.simulated_itl,
+                sandbox_cpu_limit=sandbox_cpu_limit,
             )
         agent_bindings = _retry_cluster_read_stage(
             "agent binding inventory",
@@ -5426,6 +6074,7 @@ def main() -> int:
                 reuse_existing_workspaces=True,
                 simulated_ttft_ms=args.simulated_ttft,
                 simulated_itl_ms=args.simulated_itl,
+                sandbox_cpu_limit=sandbox_cpu_limit,
             )
             agent_bindings = _retry_cluster_read_stage(
                 "post-reconcile agent binding inventory",
@@ -5611,7 +6260,13 @@ def main() -> int:
                     start = time.time()
                     # Kubernetes Jobs are immutable; include a per-process
                     # suffix so reruns never reuse a completed Job name.
-                    run_id = f"{safe_name(args.out.name)[:6] or 'run'}-{int(start) % 1000000:06d}"
+                    # The suffix must also be unique when several experiment
+                    # controllers run concurrently (concurrency sweeps launch
+                    # one process per task and they frequently start in the
+                    # same second), so mix in a stable hash of the output
+                    # directory instead of the start time alone.
+                    out_key = hashlib.sha256(str(args.out.resolve()).encode("utf-8")).hexdigest()[:6]
+                    run_id = f"{safe_name(args.out.name)[:6] or 'run'}-{int(start) % 1000000:06d}-{out_key}"
                     wait_for_job_dispatch_slot()
                     job, corpus_configmap, trace_dir, session_id = create_trace_job(
                         cluster,
@@ -5654,6 +6309,7 @@ def main() -> int:
                             expected_node=agent_node,
                             jaeger_supplier=ensure_jaeger_forward,
                             jaeger_io_lock=jaeger_io_lock,
+                            expected_cgroup_quota=tool_cgroup_quota,
                         )
                     except Exception as exc:
                         message = str(exc).lower()
@@ -5682,6 +6338,7 @@ def main() -> int:
                             expected_node=agent_node,
                             jaeger_supplier=ensure_jaeger_forward,
                             jaeger_io_lock=jaeger_io_lock,
+                            expected_cgroup_quota=tool_cgroup_quota,
                         )
                     log_phase(f"trace complete: {trace_dir}")
                     return {"position": position, "session_id": session_id, "agent": agent, "ok": True, "attempt": attempt + 1}
@@ -5729,6 +6386,9 @@ def main() -> int:
             "failed": len(failed),
             "agents": len(agent_bindings),
             "execution_workers": execution_workers,
+            "tool_cpu_ids": list(tool_cpu_ids),
+            "tool_cgroup_quota": tool_cgroup_quota or None,
+            "tool_cgroup_period_us": args.tool_cgroup_period_us if tool_cgroup_quota else None,
             "job_dispatch_interval_seconds": args.job_dispatch_interval,
             "warm_pool_size": warm_pool_size,
             "cold_start_fallback": True,
@@ -5753,6 +6413,9 @@ def main() -> int:
             str(index): node for index, node in enumerate(agent_nodes, start=1)
         },
         "allow_cross_node": args.allow_cross_node,
+        "tool_cpu_ids": list(tool_cpu_ids),
+        "tool_cgroup_quota": tool_cgroup_quota or None,
+        "tool_cgroup_period_us": args.tool_cgroup_period_us if tool_cgroup_quota else None,
         "warm_pool_size": warm_pool_size,
         "warm_pool_policy": "agent-scoped warm reuse with measured cold-start fallback",
         "measurement_caveat": "includes cross-node scheduling and network latency" if args.allow_cross_node else None,

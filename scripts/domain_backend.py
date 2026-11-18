@@ -113,25 +113,57 @@ class DomainBackend:
             "execution": "backend-fallback-rejected",
         })
 
-    def _research_result(self, state: dict[str, Any], tool: str, arguments: dict[str, Any]) -> str:
+    def _research_result(
+        self,
+        state: dict[str, Any],
+        tool: str,
+        arguments: dict[str, Any],
+        recorded_result_bytes: int | None = None,
+    ) -> str:
         query = str(arguments.get("query") or arguments.get("q") or arguments.get("url") or tool)
         lowered = tool.lower()
         if any(word in lowered for word in ("search", "query", "find")):
             state["searches"].append(query)
             digest = hashlib.sha256(query.encode()).hexdigest()[:8]
-            return json.dumps([{
+            result = [{
                 "docid": digest,
                 "score": 1.0,
                 "snippet": f"Indexed research result for: {query}",
                 "source": "trace-replay-browsecompplus-document-index",
-            }])
-        docid = str(arguments.get("docid") or arguments.get("id") or "unknown")
-        state["documents_read"].append(docid)
-        return json.dumps({
-            "docid": docid,
-            "title": f"Research document {docid}",
-            "content": f"Document content retrieved from the session-scoped index for {docid}.",
-        })
+            }]
+            text_field = "snippet"
+            item = result[0]
+        else:
+            docid = str(arguments.get("docid") or arguments.get("id") or "unknown")
+            state["documents_read"].append(docid)
+            if recorded_result_bytes is None:
+                return json.dumps({
+                    "docid": docid,
+                    "title": f"Research document {docid}",
+                    "content": f"Document content retrieved from the session-scoped index for {docid}.",
+                })
+            result = {
+                "docid": docid,
+                "title": f"Research document {docid}",
+                "text": f"Synthetic research content for document {docid}.",
+            }
+            text_field = "text"
+            item = result
+
+        if recorded_result_bytes is None:
+            return json.dumps(result)
+        if recorded_result_bytes == 0:
+            return ""
+        # Keep the tool response JSON-shaped while matching the trace's UTF-8
+        # payload size. The recorded content itself is never sent to the backend.
+        item[text_field] = ""
+        base = json.dumps(result)
+        padding = recorded_result_bytes - len(base.encode("utf-8"))
+        if padding < 0:
+            raise ValueError("recorded research result is too short for its response envelope")
+        words = "Synthetic research text for trace replay. "
+        item[text_field] = (words * ((padding // len(words)) + 1))[:padding]
+        return json.dumps(result)
 
     def _support_result(self, state: dict[str, Any], tool: str, arguments: dict[str, Any]) -> str:
         lowered = tool.lower()
@@ -168,7 +200,9 @@ class DomainBackend:
                     sandbox_result=request.get("sandbox_result"),
                 )
             elif self.workload == "research_deep_search":
-                result = self._research_result(state, tool, arguments)
+                result = self._research_result(
+                    state, tool, arguments, request.get("recorded_result_bytes")
+                )
             else:
                 result = self._support_result(state, tool, arguments)
             event = {
@@ -192,6 +226,24 @@ class DomainBackend:
                     event["sandbox_repo_root"] = str(sandbox_result.get("repo_root") or "")
                     event["sandbox_base_commit"] = str(sandbox_result.get("base_commit") or "")
                     event["sandbox_returncode"] = int(sandbox_result.get("returncode") or 0)
+                    if sandbox_result.get("operation") == "command":
+                        for field in (
+                            "command_started_epoch_ns", "command_ended_epoch_ns", "command_wall_ns",
+                            "command_user_cpu_us", "command_system_cpu_us",
+                            "command_voluntary_context_switches", "command_involuntary_context_switches",
+                            "command_minor_faults", "command_major_faults",
+                            "command_effective_cpu_ids", "command_requested_cpu_ids",
+                            "command_cgroup_quota_requested", "command_cgroup_quota_applied",
+                            "command_cgroup_quota_original",
+                            "command_cgroup_usage_usec", "command_cgroup_user_usec",
+                            "command_cgroup_system_usec", "command_cgroup_nr_throttled",
+                            "command_cgroup_throttled_usec", "command_cgroup_pressure_some_usec",
+                            "command_cgroup_pressure_full_usec",
+                        ):
+                            if field in sandbox_result:
+                                event[field] = sandbox_result[field]
+                    if int(sandbox_result.get("returncode") or 0) != 0:
+                        event["sandbox_output_prefix"] = str(sandbox_result.get("output") or "")[:512]
             self.events.append(event)
         print(json.dumps(event, separators=(",", ":")), flush=True)
         return {"ok": True, "result": result, "state_version": event["state_version"]}

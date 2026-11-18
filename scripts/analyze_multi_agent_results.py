@@ -1818,6 +1818,12 @@ def main() -> int:
             writer.writeheader()
             writer.writerows(rows)
         plot_groups(rows, out)
+        try:
+            from generate_demo_turn_plots import generate_demo_turn_plots
+
+            generate_demo_turn_plots(args.experiment, out)
+        except Exception as exc:
+            print(f"warning: demo turn plots skipped: {exc}")
     return 0
 
 

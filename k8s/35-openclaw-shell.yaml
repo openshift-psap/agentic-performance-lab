@@ -169,7 +169,7 @@ spec:
               subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--target=/tmp/py", "zstandard"])
               sys.path.insert(0, "/tmp/py")
               import zstandard
-              ver = "0.0.116"
+              ver = "0.1.8"
               arch = "amd64"
               url = f"https://github.com/NVIDIA/OpenShell/releases/download/v{ver}/openshell_{ver}-1_{arch}.deb"
               dest_dir = "/opt/openshell/bin"
@@ -266,6 +266,12 @@ spec:
               cp /openshell-mtls/ca.crt /openshell-mtls/tls.crt /openshell-mtls/tls.key /home/node/.config/openshell/gateways/openshell/mtls/
               chmod 600 /home/node/.config/openshell/gateways/openshell/mtls/tls.key
               EP="http://openshell.openshell-tracesim.svc.cluster.local:8080"
+              # trace-replay-openshell-mtls-endpoint-dir-v1
+              GATEWAY_CERT_KEY=$(printf '%s' "$EP" | sed 's@[^A-Za-z0-9._-]@_@g')
+              GATEWAY_CERT_DIR="/home/node/.config/openshell/gateways/$GATEWAY_CERT_KEY/mtls"
+              mkdir -p "$GATEWAY_CERT_DIR"
+              cp /openshell-mtls/ca.crt /openshell-mtls/tls.crt /openshell-mtls/tls.key "$GATEWAY_CERT_DIR/"
+              chmod 600 "$GATEWAY_CERT_DIR/tls.key"
               /opt/openshell/bin/openshell gateway remove openshell >/dev/null 2>&1 || true
               /opt/openshell/bin/openshell gateway add "$EP" --local --name openshell
               exec node openclaw.mjs gateway run --bind lan --port 18790

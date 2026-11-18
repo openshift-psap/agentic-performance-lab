@@ -1,4 +1,6 @@
 import json
+import base64
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -8,13 +10,20 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
+import run_experiment as experiment
+
 from run_experiment import (
+    _install_pinned_openshell_wrapper,
+    _swe_sandbox_command,
+    _workload_command,
     _preflight_kueue_admission,
     agent_name_prefix,
     build_queue,
     create_trace_job,
     ensure_shared_workspace,
     pack_mock_corpus_sessions,
+    parse_tool_cgroup_quota,
+    tool_cgroup_quota_cpu_quantity,
     prepare_workload_corpus,
     workspace_name,
 )
@@ -117,6 +126,157 @@ def test_mock_corpus_packing_preserves_sessions_and_bounds_objects():
         len(json.dumps({"sessions": part}, separators=(",", ":")).encode("utf-8")) <= 500
         for part in parts
     )
+
+
+def test_research_command_passes_only_recorded_result_size():
+    command = _workload_command(
+        "r1", "research_deep_search", "browsecompplus", 3, 0,
+        "mcp__environment__get_document", {"docid": "47683"},
+        "http://research-backend:8093", 7005,
+    )
+    encoded = re.search(r"base64\.b64decode\('([^']+)'\)", command[2]).group(1)
+    payload = json.loads(base64.b64decode(encoded))
+    assert payload["recorded_result_bytes"] == 7005
+    assert payload["arguments"] == {"docid": "47683"}
+    assert "recorded_result" not in payload
+
+
+def test_swe_command_records_cpu_measurements_and_requested_affinity():
+    task = SweTask(
+        session_id="swe-1",
+        instance_id="owner__repo-1",
+        repo="owner/repo",
+        repo_url="https://github.com/owner/repo.git",
+        base_commit="0123456789abcdef0123456789abcdef01234567",
+        environment_setup_commit="fedcba9876543210fedcba9876543210fedcba98",
+        image="swebench/task:1",
+        version="test",
+    )
+    command = _swe_sandbox_command(
+        "swe-1", "software_engineering_qa", "swebench", 2, 3,
+        "mcp__environment__bash", {"command": "python -m pytest tests/"},
+        "http://backend:8092", task, (12, 14),
+    )
+    assert command[:2] == ["python3", "-c"]
+    compile(command[2], "swe-sandbox-command", "exec")
+    encoded = re.search(r"base64\.b64decode\('([^']+)'\)", command[2]).group(1)
+    payload = json.loads(base64.b64decode(encoded))
+    assert payload["tool_cpu_ids"] == [12, 14]
+    assert payload["tool_cgroup_quota"] == ""
+    assert "command_wall_ns" in command[2]
+    assert "command_user_cpu_us" in command[2]
+
+
+def test_swe_command_applies_cgroup_quota_and_captures_throttling():
+    task = SweTask(
+        session_id="swe-1",
+        instance_id="owner__repo-1",
+        repo="owner/repo",
+        repo_url="https://github.com/owner/repo.git",
+        base_commit="0123456789abcdef0123456789abcdef01234567",
+        environment_setup_commit="fedcba9876543210fedcba9876543210fedcba98",
+        image="swebench/task:1",
+        version="test",
+    )
+    command = _swe_sandbox_command(
+        "swe-1", "software_engineering_qa", "swebench", 2, 3,
+        "mcp__environment__bash", {"command": "python -m pytest tests/"},
+        "http://backend:8092", task, (12, 14), "50000 100000",
+    )
+    compile(command[2], "swe-sandbox-command", "exec")
+    encoded = re.search(r"base64\.b64decode\('([^']+)'\)", command[2]).group(1)
+    payload = json.loads(base64.b64decode(encoded))
+    assert payload["tool_cgroup_quota"] == "50000 100000"
+    assert "cpu.stat" in command[2]
+    assert "cpu.pressure" in command[2]
+    assert "command_cgroup_quota_requested" in command[2]
+    assert "command_cgroup_throttled_usec" in command[2]
+    assert "command_cgroup_pressure_some_usec" in command[2]
+    assert "cpu.max" not in command[2]
+
+
+def test_sandbox_cgroup_merge_enforces_expected_quota(tmp_path):
+    raw = tmp_path / "sandbox_samples"
+    raw.mkdir()
+    header = ",".join(experiment.CGROUP_SAMPLE_COLUMNS)
+    row = {column: "0" for column in experiment.CGROUP_SAMPLE_COLUMNS}
+    row.update({
+        "epoch_ns": "1",
+        "cpu_usage_usec": "10",
+        "memory_bytes": "20",
+        "cpu_quota": "50000",
+        "cpu_period": "100000",
+    })
+    sample = raw / "sandbox.csv"
+    sample.write_text(
+        header + "\n" + ",".join(row[column] for column in experiment.CGROUP_SAMPLE_COLUMNS) + "\n",
+        encoding="utf-8",
+    )
+
+    experiment._merge_sandbox_cgroup_samples(tmp_path, "50000 100000")
+    assert (tmp_path / "openshell_sandbox.csv").exists()
+
+    row["cpu_quota"] = "max"
+    sample.write_text(
+        header + "\n" + ",".join(row[column] for column in experiment.CGROUP_SAMPLE_COLUMNS) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError):
+        experiment._merge_sandbox_cgroup_samples(tmp_path, "50000 100000")
+
+    sample.unlink()
+    with pytest.raises(RuntimeError):
+        experiment._merge_sandbox_cgroup_samples(tmp_path, "50000 100000")
+
+
+def test_tool_cgroup_quota_maps_to_kubernetes_cpu_quantity():
+    assert tool_cgroup_quota_cpu_quantity("50000 100000") == "500m"
+    assert tool_cgroup_quota_cpu_quantity("200000 100000") == "2000m"
+    assert tool_cgroup_quota_cpu_quantity("50000 200000") == "250m"
+    with pytest.raises(ValueError):
+        tool_cgroup_quota_cpu_quantity("max 100000")
+
+
+def test_sandbox_wrapper_injects_cpu_limit_at_create_time():
+    deployment = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [{"name": "gateway", "env": [], "args": []}],
+                    "initContainers": [{"name": "init-config", "args": [""]}],
+                }
+            }
+        }
+    }
+    changed = _install_pinned_openshell_wrapper(
+        deployment,
+        "diadochos-hqxzk-gpu-h100-lljhv",
+        "aharush-test",
+        None,
+        sandbox_cpu_limit="500m",
+    )
+    assert changed is True
+    script = deployment["spec"]["template"]["spec"]["initContainers"][0]["args"][0]
+    assert 'const sandboxCpu = "500m"' in script
+    assert "injected.push('--cpu', sandboxCpu)" in script
+    assert "args[i] === '--cpu'" in script
+
+
+def test_tool_cgroup_quota_parses_cores_into_cpu_max():
+    assert parse_tool_cgroup_quota("0.5") == "50000 100000"
+    assert parse_tool_cgroup_quota("2") == "200000 100000"
+    assert parse_tool_cgroup_quota("0.25", 200_000) == "50000 200000"
+    assert parse_tool_cgroup_quota("8") == "800000 100000"
+    with pytest.raises(ValueError):
+        parse_tool_cgroup_quota("0")
+    with pytest.raises(ValueError):
+        parse_tool_cgroup_quota("-1")
+    with pytest.raises(ValueError):
+        parse_tool_cgroup_quota("2048")
+    with pytest.raises(ValueError):
+        parse_tool_cgroup_quota("2", 500)
+    with pytest.raises(ValueError):
+        parse_tool_cgroup_quota("0.001")
 
 
 class _FakeCluster:
@@ -316,3 +476,15 @@ def test_agent_resource_names_fit_the_label_value_limit():
 
     assert len(f"{prefix}-config-01") <= 63
     assert len(f"{prefix}-01") <= 63
+
+
+def test_strict_ownership_rejects_existing_cluster_names(monkeypatch):
+    monkeypatch.setattr(experiment, "STRICT_OWNERSHIP", True)
+    monkeypatch.setattr(experiment, "RESOURCE_PREFIX", "aharush")
+    monkeypatch.setattr(experiment, "OWNED_NAMESPACES", {"aharush-agentic-cpu"})
+
+    experiment.assert_owned_target("aharush-agentic-cpu", "aharush-swebench-backend")
+    with pytest.raises(RuntimeError, match="strict ownership refused"):
+        experiment.assert_owned_target("trace-replay", "aharush-swebench-backend")
+    with pytest.raises(RuntimeError, match="strict ownership refused"):
+        experiment.assert_owned_target("aharush-agentic-cpu", "trace-replay-swebench-backend")
