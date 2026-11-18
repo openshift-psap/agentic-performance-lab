@@ -284,6 +284,19 @@ def test_phantom_turn_detection():
     assert not is_phantom_turn({"output_tokens": 0, "content": "", "tool_calls": [{"id": "x"}]})
 
 
+def test_swe_bash_command_reaches_openclaw_before_execution_mapping(monkeypatch):
+    monkeypatch.setenv("MAP_TOOLS_TO_SANDBOX", "1")
+    original = "python -m pytest astropy/io/ascii/tests/test_html.py"
+    calls = mock_llm.openai_tool_calls([{
+        "name": "mcp__environment__bash",
+        "arguments": {"command": original},
+        "swe_original_command": original,
+        "mapped_command": ["python3", "/tmp/trace-replay-tool-calls/0001-000.py"],
+    }])
+    assert calls[0]["function"]["name"] == "exec"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": original}
+
+
 def test_mapped_tool_stream_uses_full_decode_budget_and_explicit_zero(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(mock_llm, "OTLP_ENDPOINT", "")
     monkeypatch.setenv("MAP_TOOLS_TO_SANDBOX", "1")
@@ -509,6 +522,8 @@ def test_per_turn_edges_timing_and_correlation(tmp_path: Path, monkeypatch):
     assert recs[0]["ttft_measured_ms"] >= 45.0            # sleep only adds time
     assert recs[0]["decode_measured_ms"] >= 60.0          # ~4*16.8
     assert recs[0]["recorded_duration_ms"] == 30000.0     # kept as reference only
+    assert all(r["t_recv_ns"] <= r["t_body_read_ns"] <= r["t_first_emit_ns"] for r in recs)
+    assert all(r["t_recv_wall_ns"] <= r["t_body_read_wall_ns"] for r in recs)
 
     # Skew-free inter-turn gap G[i] is computable and non-negative (single clock).
     g0 = recs[1]["t_recv_ns"] - recs[0]["t_end_emit_ns"]

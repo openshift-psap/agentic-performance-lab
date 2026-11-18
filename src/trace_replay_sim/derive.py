@@ -17,7 +17,7 @@ Five buckets per turn (execution order within a turn):
 * **D. response processing**: ``tool.execution[i].start - model.call[i].end``.
 * **E. model decode**: mock ``decode_set_ms``; cross-checked by ``decode_measured_ms``.
 
-Skew-free constraint (single mock clock): ``G[i] = t_recv[i+1] - t_end_emit[i]``
+Skew-free constraint (single mock clock): ``G[i] = t_body_read[i+1] - t_end_emit[i]``
 should equal ``D[i] + B[i] + A[i+1]``. The delta is reported as an agreement check.
 """
 
@@ -184,7 +184,10 @@ def derive_per_turn(
         sedges = [e for e in sedges if not e.get("warmup")]
         real = [e for e in sedges if not e.get("phantom") and not e.get("exhausted") and not e.get("miss")]
         # G[i] from the FULL ordered edge list (needs the next call's t_recv, even if terminal).
-        recv_by_seq = {e.get("turn_seq"): e.get("t_recv_ns") for e in sedges}
+        recv_by_seq = {
+            e.get("turn_seq"): e.get("t_body_read_ns") or e.get("t_recv_ns")
+            for e in sedges
+        }
 
         for pos, e in enumerate(real):
             seq = e.get("turn_seq")
@@ -240,6 +243,7 @@ def derive_per_turn(
             mock_first_to_tool_ms = None
             mock_last_to_tool_ms = None
             context_assembly_direct_ms = None
+            context_assembly_complete_ms = None
             if e.get("t_first_emit_ns") is not None and e.get("t_end_emit_ns") is not None:
                 mock_stream_ms = round((e["t_end_emit_ns"] - e["t_first_emit_ns"]) / 1e6, 3)
             if e.get("t_first_visible_emit_ns") is not None and e.get("t_first_emit_ns") is not None:
@@ -274,6 +278,11 @@ def derive_per_turn(
                     prev_end = _us_to_ms(runs[0].get("startTime"))
                 if prev_end is not None:
                     a_ms = round(max(0.0, mc_start - prev_end), 3)
+                    body_read_wall_ns = e.get("t_body_read_wall_ns")
+                    if body_read_wall_ns is not None:
+                        elapsed = int(body_read_wall_ns) / 1e6 - prev_end
+                        if 0 <= elapsed < 60_000:
+                            context_assembly_complete_ms = round(elapsed, 3)
 
                 # This turn's tool hop = first hop starting after this model call.
                 turn_hops = [h for h in hops if (h.get("startTime") or 0) / 1000.0 >= mc_start]
@@ -375,6 +384,7 @@ def derive_per_turn(
                 # Bucket A (pre-model overhead)
                 "A_premodel_ms": a_ms,
                 "context_assembly_direct_ms": context_assembly_direct_ms,
+                "context_assembly_complete_ms": context_assembly_complete_ms,
                 # Bucket B (sandbox init/exec)
                 "B_sandbox_ms": b_ms,
                 "B_sandbox_k8s_cold_ms": round(cold_ready_ms, 3) if (is_cold and cold_ready_ms is not None) else None,

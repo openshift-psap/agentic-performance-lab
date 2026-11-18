@@ -1,6 +1,6 @@
 """Functional conformance checks for recorded agent-trace replays.
 
-The performance plots answer *how long* the replay took.  This module answers
+The performance tables answer *how long* the replay took.  This module answers
 whether the replay followed the recorded workflow.  It deliberately compares
 stable, observable facts rather than model text: turn order, tool counts,
 stateful-backend calls, redacted argument fingerprints, and the first-turn
@@ -128,8 +128,8 @@ def _expected_tools(session: dict[str, Any]) -> list[dict[str, Any]]:
                 "arguments_sha256": arguments_sha256(call.get("arguments") or {}),
                 "expected_returncode": expected_returncode,
                 "recorded_dependency_failure": bool(re.search(
-                    r"ModuleNotFoundError|No module named\s+\S+|ImportError:",
-                    recorded_output, re.IGNORECASE,
+                    r"^\s*(?:(?:ModuleNotFoundError|ImportError):|(?:\S*/)?python(?:\d+(?:\.\d+)?)?:\s*No module named\b)",
+                    recorded_output, re.IGNORECASE | re.MULTILINE,
                 )),
             })
     return calls
@@ -170,7 +170,7 @@ def _mock_edges(trace_dir: Path, session_id: str) -> list[dict[str, Any]]:
 
 
 def _phase_check(trace_dir: Path, expected_turns: int) -> dict[str, Any]:
-    path = trace_dir / "data/shell/profile-v2/diagrams/per_turn_efficiency.csv"
+    path = trace_dir / "data/shell/profile-v2/tables/per_turn_efficiency.csv"
     if not path.exists():
         return _check("phase_invariant", False, details="per_turn_efficiency.csv is missing")
     try:
@@ -316,11 +316,16 @@ def verify_trace(
                     and event.get("sandbox_returncode") is not None
                     and (int(event["turn"]), int(event["call"])) in expected_codes
                 }
+                def serializable_codes(codes: dict[tuple[int, int], int]) -> list[dict[str, int]]:
+                    return [
+                        {"turn": turn, "call": call, "returncode": code}
+                        for (turn, call), code in sorted(codes.items())
+                    ]
                 checks.append(_check(
                     "swe_recorded_exit_codes",
                     observed_codes == expected_codes,
-                    expected=expected_codes,
-                    observed=observed_codes,
+                    expected=serializable_codes(expected_codes),
+                    observed=serializable_codes(observed_codes),
                     details="recorded command exit codes agree with sandbox execution",
                 ))
             unexpected_dependency_failures = [

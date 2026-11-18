@@ -247,9 +247,13 @@ class DomainBackend:
                     event["sandbox_repo_root"] = str(sandbox_result.get("repo_root") or "")
                     event["sandbox_base_commit"] = str(sandbox_result.get("base_commit") or "")
                     event["sandbox_returncode"] = int(sandbox_result.get("returncode") or 0)
+                    # A pipeline such as `pytest | tee` may report status 0
+                    # even when Python printed a genuine import failure.
+                    # Anchor to diagnostic lines so source-code snippets that
+                    # merely mention these strings are not treated as errors.
                     event["sandbox_dependency_failure"] = bool(re.search(
-                        r"ModuleNotFoundError|No module named\s+\S+|ImportError:",
-                        str(sandbox_result.get("output") or ""), re.IGNORECASE,
+                        r"^\s*(?:(?:ModuleNotFoundError|ImportError):|(?:\S*/)?python(?:\d+(?:\.\d+)?)?:\s*No module named\b)",
+                        str(sandbox_result.get("output") or ""), re.IGNORECASE | re.MULTILINE,
                     ))
                     if sandbox_result.get("operation") == "command":
                         for field in (

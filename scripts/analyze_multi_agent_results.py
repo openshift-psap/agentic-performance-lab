@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build experiment-level cross-agent/workload summaries and plots."""
+"""Build experiment-level cross-agent/workload measurement tables."""
 
 from __future__ import annotations
 
@@ -17,12 +17,9 @@ from typing import Any
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 
-REQUIRED_PER_AGENT_PLOTS = (
-    "latency_waterfall.png",
-    "openshell_execution_latency_ms.png",
-    "resource_memory_mib.png",
-    "resource_cpu_cores.png",
-    "resource_timeseries.png",
+REQUIRED_PER_AGENT_TABLES = (
+    "per_turn_latency.csv", "per_turn_efficiency.csv", "per_tool_latency.csv",
+    "stage_latency_summary.csv", "resource_samples.csv", "resource_summary.csv",
 )
 
 
@@ -1421,15 +1418,15 @@ def summarize_trace(trace: Path) -> dict[str, Any]:
     if appworld_events_path.exists():
         backend_kind = "appworld"
         events_path = appworld_events_path
-        backend_plot = trace / "data/appworld/appworld_api_latency.png"
+        backend_table = trace / "data/appworld/backend_calls.csv"
     elif generic_backend_events_path.exists():
         backend_kind = "workload"
         events_path = generic_backend_events_path
-        backend_plot = trace / "data/backend/backend_api_latency.png"
+        backend_table = trace / "data/backend/backend_calls.csv"
     else:
         backend_kind = "missing"
         events_path = None
-        backend_plot = None
+        backend_table = None
     events = []
     if events_path:
         for line in events_path.read_text(encoding="utf-8").splitlines():
@@ -1442,7 +1439,7 @@ def summarize_trace(trace: Path) -> dict[str, Any]:
     cgroup_openclaw = cgroup_stats(cgroup / "openclaw_gateway.csv", **measured_window)
     cgroup_sandbox = cgroup_stats(cgroup / "openshell_sandbox.csv", **measured_window)
     cgroup_openshell_gw = cgroup_stats(cgroup / "openshell_gateway.csv", **measured_window)
-    diagrams = shell / "profile-v2/diagrams"
+    tables = shell / "profile-v2/tables"
     lifecycle_reuse_raw = lifecycle.get("sandbox_reuse_ms")
     lifecycle_reuse_measurement = str(
         lifecycle.get("sandbox_reuse_measurement") or ""
@@ -1455,13 +1452,13 @@ def summarize_trace(trace: Path) -> dict[str, Any]:
         and (float(lifecycle_reuse_raw) > 0.0 or lifecycle_reuse_measurement)
         else None
     )
-    missing_plots = [
+    missing_tables = [
         name
-        for name in REQUIRED_PER_AGENT_PLOTS
-        if not (diagrams / name).exists() or (diagrams / name).stat().st_size < 1000
+        for name in REQUIRED_PER_AGENT_TABLES
+        if not (tables / name).exists() or (tables / name).stat().st_size == 0
     ]
-    if backend_plot is None or not backend_plot.exists() or backend_plot.stat().st_size < 1000:
-        missing_plots.append("appworld_api_latency.png" if backend_kind == "appworld" else "backend_api_latency.png")
+    if backend_table is None or not backend_table.exists() or backend_table.stat().st_size == 0:
+        missing_tables.append("backend_calls.csv")
     tool_ms = [float(row.get("duration_ms") or 0) for row in tools]
     app_ms = [float(row.get("elapsed_ms") or 0) for row in events]
     tool_errors = sum(row.get("error_category") not in (None, "") for row in tools)
@@ -1508,8 +1505,8 @@ def summarize_trace(trace: Path) -> dict[str, Any]:
         "sandbox_provisioning_mode": str(lifecycle.get("provisioning_mode") or "unknown"),
         "conversational_trace": bool(lifecycle.get("conversational_trace")),
         "sandbox_request_to_first_action_ms": lifecycle.get("sandbox_request_to_first_action_ms"),
-        "per_agent_plot_status": "complete" if not missing_plots else "incomplete",
-        "missing_per_agent_plots": ";".join(missing_plots),
+        "per_agent_table_status": "complete" if not missing_tables else "incomplete",
+        "missing_per_agent_tables": ";".join(missing_tables),
         "harness_ms": max((float(row.get("harness_total_ms") or 0) for row in timing), default=0),
         "model_total_ms": sum(float(row.get("model_call_total_ms") or 0) for row in timing),
         "context_total_ms": sum(float(row.get("context_assembly_ms") or 0) for row in timing),
@@ -1567,7 +1564,7 @@ def write_quality_gate(rows: list[dict[str, Any]], out: Path) -> None:
         # Conversational traces (zero recorded tool calls) have no tool stage
         # by design: OpenShell execution and sandbox-acquisition metrics are
         # not applicable and are excluded from tool-stage aggregates. Their
-        # lifecycle, plots, and functional conformance must still pass.
+        # lifecycle, tables, and functional conformance must still pass.
         conversational = bool(row.get("conversational_trace"))
         if row.get("benchmark_eligible") is False:
             reasons.append("successful diagnostic retry is excluded from benchmark scoring")
@@ -1579,8 +1576,8 @@ def write_quality_gate(rows: list[dict[str, Any]], out: Path) -> None:
             reasons.append("no OpenShell sandbox cgroup samples")
         if str(row.get("sandbox_init_status") or "") != "ready":
             reasons.append("sandbox create-to-ready lifecycle not captured")
-        if str(row.get("per_agent_plot_status") or "") != "complete":
-            reasons.append(f"missing per-agent plots: {row.get('missing_per_agent_plots')}")
+        if str(row.get("per_agent_table_status") or "") != "complete":
+            reasons.append(f"missing per-agent tables: {row.get('missing_per_agent_tables')}")
         if str(row.get("functional_conformance_status") or "") not in {"PASS", "PASS_WITH_WARNINGS"}:
             reasons.append(f"functional conformance: {row.get('functional_conformance_status')}: {row.get('functional_conformance_failures')}")
         checks.append({"trace": row.get("trace"), "passed": not reasons, "reasons": reasons, "conversational_trace": conversational})
@@ -1904,6 +1901,101 @@ def write_concurrency_timeline(rows: list[dict[str, Any]], out: Path) -> dict[st
     return summary
 
 
+def write_combined_tables(experiment: Path, rows: list[dict[str, Any]], out: Path) -> None:
+    """Collect per-trace CSV measurements without rendering figures."""
+    final_latency_fields = (
+        "trace", "session_id", "workload", "agent", "trace_id", "turn",
+        "context_assembly_ms", "response_processing_ms", "openshell_execution_ms",
+        "input_tokens", "output_tokens", "prompt_chars", "request_bytes",
+        "input_messages", "input_message_chars",
+    )
+    sources = {
+        "per_turn_latency.csv": "data/shell/profile-v2/tables/per_turn_latency.csv",
+        "per_tool_latency.csv": "data/shell/profile-v2/tables/per_tool_latency.csv",
+        "resource_samples.csv": "data/shell/profile-v2/tables/resource_samples.csv",
+        "resource_summary.csv": "data/shell/profile-v2/tables/resource_summary.csv",
+    }
+    for name, relative in sources.items():
+        combined: list[dict[str, Any]] = []
+        fields = list(final_latency_fields) if name == "per_turn_latency.csv" else ["trace", "session_id", "workload", "agent"]
+        for summary in rows:
+            source = experiment / "traces" / str(summary["trace"]) / relative
+            if not source.exists():
+                continue
+            with source.open(encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if name != "per_turn_latency.csv":
+                    for field in reader.fieldnames or []:
+                        if field not in fields:
+                            fields.append(field)
+                for item in reader:
+                    record = {
+                        "trace": summary["trace"], "session_id": summary["session_id"],
+                        "workload": summary["workload"], "agent": summary["agent"], **item,
+                    }
+                    if name == "per_turn_latency.csv":
+                        # The requested final schema aliases the context-to-model-end
+                        # interval as context_assembly_ms. Raw pre-model receipt timing
+                        # remains available in each trace's source profile.
+                        record["context_assembly_ms"] = item.get("context_to_model_end_ms", "")
+                    combined.append(record)
+        with (out / name).open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(combined)
+    calls = []
+    for summary in rows:
+        trace = experiment / "traces" / str(summary["trace"])
+        source = trace / "data" / ("appworld" if (trace / "data/appworld/backend_calls.csv").exists() else "backend") / "backend_calls.csv"
+        if source.exists():
+            with source.open(encoding="utf-8", newline="") as handle:
+                calls.extend({
+                    "trace": summary["trace"], "session_id": summary["session_id"],
+                    "workload": summary["workload"], "agent": summary["agent"], **item,
+                } for item in csv.DictReader(handle))
+    fields = list(dict.fromkeys(key for item in calls for key in item)) or ["trace", "session_id", "workload", "agent", "turn", "call", "tool"]
+    with (out / "backend_calls.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(calls)
+    latency_path = out / "per_turn_latency.csv"
+    with latency_path.open(encoding="utf-8", newline="") as handle:
+        latency_rows = list(csv.DictReader(handle))
+    stages = ("context_assembly_ms", "response_processing_ms", "openshell_execution_ms")
+    stage_rows = []
+    for workload in ["all", *sorted({str(row["workload"]) for row in latency_rows})]:
+        selected = latency_rows if workload == "all" else [row for row in latency_rows if row["workload"] == workload]
+        for stage in stages:
+            values = []
+            for row in selected:
+                try:
+                    values.append(float(row[stage]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            stage_rows.append({
+                "workload": workload, "stage": stage, "unit": "ms", "n": len(values),
+                "mean": statistics.mean(values) if values else "",
+                "p50": statistics.median(values) if values else "",
+                "p95": percentile(values, 0.95) if values else "",
+                "min": min(values) if values else "", "max": max(values) if values else "",
+            })
+    with (out / "stage_latency_summary.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("workload", "stage", "unit", "n", "mean", "p50", "p95", "min", "max"))
+        writer.writeheader()
+        writer.writerows(stage_rows)
+    (out / "README.md").write_text(
+        "# Experiment measurement tables\n\n"
+        "- `per_turn_latency.csv`: per-turn latency across all traces, identified by trace, session, workload, and agent. In our reporting terminology, `context_assembly_ms` combines agent context preparation, request transfer, and the model-call interval into one wall-clock measure: from the prior tool result (or initial harness start) through the end of the OpenClaw model-call span. The source profile retains the component boundaries for deeper analysis; the final table intentionally reports them together.\n"
+        "- `stage_latency_summary.csv`: per-workload and whole-run latency distributions; `n` counts turns with a measured value.\n"
+        "- `per_tool_latency.csv` and `backend_calls.csv`: OpenClaw tool spans and backend/sandbox call observations. Their timing boundaries differ.\n"
+        "- `resource_samples.csv` and `resource_summary.csv`: component cgroup samples and within-driver-window summaries. A zero sample count means missing coverage, not zero usage.\n"
+        "- `cross_agent_summary.csv`: one trace per row, including validity and resource coverage fields.\n"
+        "- `shared_gateway_resource_summary.csv`, when present: the run-wide OpenShell gateway, which is shared rather than assigned to one agent.\n\n"
+        "Raw telemetry and per-trace table definitions remain under each trace directory.\n",
+        encoding="utf-8",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment", type=Path, required=True)
@@ -1922,18 +2014,16 @@ def main() -> int:
         (out / "shared_gateway_resource_summary.json").write_text(
             json.dumps(shared_gateway, indent=2) + "\n", encoding="utf-8"
         )
+        with (out / "shared_gateway_resource_summary.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["component", *shared_gateway.keys()])
+            writer.writeheader()
+            writer.writerow({"component": "openshell_gateway", **shared_gateway})
     if rows:
         with (out / "cross_agent_summary.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
-        plot_groups(rows, out)
-        try:
-            from generate_demo_turn_plots import generate_demo_turn_plots
-
-            generate_demo_turn_plots(args.experiment, out)
-        except Exception as exc:
-            print(f"warning: demo turn plots skipped: {exc}")
+        write_combined_tables(args.experiment, rows, out)
     return 0
 
 

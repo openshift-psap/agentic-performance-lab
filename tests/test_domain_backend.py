@@ -95,3 +95,18 @@ def test_swe_backend_marks_missing_dependency_even_when_shell_exit_is_zero(tmp_p
         "call": 0,
     })
     assert backend.events[-1]["sandbox_dependency_failure"] is True
+
+
+def test_swe_backend_does_not_treat_source_text_as_missing_dependency(tmp_path):
+    backend = DomainBackend("software_engineering_qa", tmp_path / "swe")
+    backend.execute({
+        "session_id": "swe-source-text", "benchmark": "swebench",
+        "tool": "mcp__environment__bash", "arguments": {"command": "grep ImportError source.py"},
+        "execution_mode": "sandbox",
+        "sandbox_result": {
+            "output": 'source.py:12: print("ImportError: example")',
+            "returncode": 0, "repo_root": "/testbed", "base_commit": "abc",
+        },
+        "turn": 0, "call": 0,
+    })
+    assert backend.events[-1]["sandbox_dependency_failure"] is False

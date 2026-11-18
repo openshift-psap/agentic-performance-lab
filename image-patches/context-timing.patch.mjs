@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const dist = "/app/dist";
+const dist = process.env.OPENCLAW_DIST || "/app/dist";
 const builtinPath = fs
   .readdirSync(dist)
   .filter((name) => name.startsWith("builtin-openclaw-") && name.endsWith(".js"))
@@ -19,7 +19,8 @@ if (!builtinPath || !runtimePath) {
 
 let builtin = fs.readFileSync(builtinPath, "utf8");
 const functionNeedle = "function observeEmbeddedAttemptPrompt(input) {\n\tconst { attempt } = input;";
-if (!builtin.includes("const contextAssemblyStartMs = Date.now();")) {
+const patchedFunctionNeedle = "const contextAssemblyStartMs = input.contextAssemblyStartMs ?? Date.now();";
+if (!builtin.includes(patchedFunctionNeedle)) {
   if (!builtin.includes(functionNeedle)) throw new Error("Context prompt function shape changed");
   builtin = builtin.replace(
     functionNeedle,
@@ -27,7 +28,7 @@ if (!builtin.includes("const contextAssemblyStartMs = Date.now();")) {
   );
 }
 const eventNeedle = "trace: freezeDiagnosticTraceContext(createChildDiagnosticTraceContext(input.runTrace))";
-if (!builtin.includes("\n\t\tcontextAssemblyStartMs")) {
+if (!builtin.includes(`${eventNeedle},\n\t\tcontextAssemblyStartMs`)) {
   if (!builtin.includes(eventNeedle)) throw new Error("Context diagnostic event shape changed");
   builtin = builtin.replace(eventNeedle, `${eventNeedle},\n\t\tcontextAssemblyStartMs`);
 }
@@ -43,11 +44,15 @@ fs.writeFileSync(builtinPath, builtin);
 
 let runtime = fs.readFileSync(runtimePath, "utf8");
 const spanNeedle = 'spanWithDuration("openclaw.context.assembled", spanAttrs, 0, {';
-if (!runtime.includes(spanNeedle)) throw new Error("Context span recorder shape changed");
-runtime = runtime.replace(
-  spanNeedle,
-  'spanWithDuration("openclaw.context.assembled", spanAttrs, evt.contextAssemblyStartMs ?? 0, {',
-);
+// This fixes the run-level initial-prompt span only. Per-model-call context
+// latency is measured by joining tool-result and model-endpoint receipt edges.
+// spanWithDuration takes an elapsed duration, not a start timestamp. Passing
+// Date.now() as its third argument moves the span back to 1970.
+const patchedSpanNeedle = 'spanWithDuration("openclaw.context.assembled", spanAttrs, evt.contextAssemblyStartMs == null ? 0 : Math.max(0, evt.ts - evt.contextAssemblyStartMs), {';
+if (!runtime.includes(patchedSpanNeedle)) {
+  if (!runtime.includes(spanNeedle)) throw new Error("Context span recorder shape changed");
+  runtime = runtime.replace(spanNeedle, patchedSpanNeedle);
+}
 fs.writeFileSync(runtimePath, runtime);
 
 console.log(JSON.stringify({ builtinPath, runtimePath }));

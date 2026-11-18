@@ -1,26 +1,22 @@
 """Fail-closed validation for one completed trace's measurement artifacts.
 
-The benchmark must not report a successful trace merely because PNG files were
-created.  This module checks the relationships that make the plots meaningful:
+The benchmark must not report a successful trace merely because CSV files were
+created.  This module checks the relationships that make the tables meaningful:
 the expected turn/tool cardinality, the first-turn phase invariant, non-negative
-timings, raw telemetry presence, cgroup samples, and valid PNG artifacts.
+timings, raw telemetry presence, cgroup samples, and tabular measurements.
 """
 
 from __future__ import annotations
 
 import csv
 import json
-import struct
 from pathlib import Path
 from typing import Any
 
 
-REQUIRED_PLOTS = (
-    "latency_waterfall.png",
-    "openshell_execution_latency_ms.png",
-    "resource_memory_mib.png",
-    "resource_cpu_cores.png",
-    "resource_timeseries.png",
+REQUIRED_TABLES = (
+    "per_turn_latency.csv", "per_turn_efficiency.csv", "per_tool_latency.csv",
+    "stage_latency_summary.csv", "resource_samples.csv", "resource_summary.csv",
 )
 PHASE_COLUMNS = (
     "turn",
@@ -55,19 +51,6 @@ def _number(value: Any, *, path: Path, field: str) -> float:
     return result
 
 
-def _png_dimensions(path: Path) -> tuple[int, int]:
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise OutputValidationError(f"missing plot: {path}") from exc
-    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n":
-        raise OutputValidationError(f"plot is not a PNG: {path}")
-    width, height = struct.unpack(">II", raw[16:24])
-    if width < 100 or height < 100:
-        raise OutputValidationError(f"plot is implausibly small: {path} ({width}x{height})")
-    return width, height
-
-
 def _valid_cgroup_rows(path: Path) -> int:
     try:
         rows = list(csv.DictReader(path.open(encoding="utf-8")))
@@ -92,19 +75,18 @@ def validate_trace_output(
     expected_turns: int,
     expected_tool_calls: int,
     backend_dir_name: str,
-    backend_plot_name: str,
 ) -> dict[str, Any]:
     """Validate one trace and return machine-readable evidence.
 
     This intentionally does not validate semantic task correctness; that is
     handled by ``functional_conformance``.  It validates that the performance
-    artifacts are complete enough to make the conformance result and plots
+    artifacts are complete enough to make the conformance result and tables
     interpretable.
     """
     trace_dir = Path(trace_dir)
     shell = trace_dir / "data/shell"
     profile = shell / "profile-v2"
-    diagrams = profile / "diagrams"
+    tables = profile / "tables"
     failures: list[str] = []
 
     per_turn = _json(profile / "per_turn.json", None)
@@ -115,7 +97,7 @@ def validate_trace_output(
         failures.append(f"per_tool.json expected {expected_tool_calls} rows")
 
     phase_rows: list[dict[str, str]] = []
-    phase_path = diagrams / "per_turn_efficiency.csv"
+    phase_path = tables / "per_turn_efficiency.csv"
     try:
         with phase_path.open(encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -217,19 +199,27 @@ def validate_trace_output(
     if not isinstance(collect_manifest, dict):
         failures.append("Prometheus collect_manifest.json is missing")
 
-    plot_paths = [diagrams / name for name in REQUIRED_PLOTS]
-    plot_paths.append(trace_dir / "data" / backend_dir_name / backend_plot_name)
-    plot_evidence: dict[str, list[int]] = {}
-    for path in plot_paths:
+    table_evidence: dict[str, int] = {}
+    for path in [*(tables / name for name in REQUIRED_TABLES), trace_dir / "data" / backend_dir_name / "backend_calls.csv"]:
         try:
-            if path.stat().st_size < 1000:
-                raise OutputValidationError(f"plot is empty or too small: {path}")
-            plot_evidence[str(path.relative_to(trace_dir))] = list(_png_dimensions(path))
+            with path.open(encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if not reader.fieldnames:
+                    raise OutputValidationError(f"table has no header: {path}")
+                table_evidence[str(path.relative_to(trace_dir))] = sum(1 for _ in reader)
         except (OSError, OutputValidationError) as exc:
             failures.append(str(exc))
+    if table_evidence.get("data/shell/profile-v2/tables/per_turn_latency.csv") != expected_turns:
+        failures.append(f"per_turn_latency.csv expected {expected_turns} rows")
+    if table_evidence.get("data/shell/profile-v2/tables/per_tool_latency.csv") != expected_tool_calls:
+        failures.append(f"per_tool_latency.csv expected {expected_tool_calls} rows")
+    if expected_tool_calls and table_evidence.get(f"data/{backend_dir_name}/backend_calls.csv", 0) < expected_tool_calls:
+        failures.append(f"backend_calls.csv expected at least {expected_tool_calls} rows")
+    if not table_evidence.get("data/shell/profile-v2/tables/resource_samples.csv", 0):
+        failures.append("resource_samples.csv has no measurements")
 
     evidence = {
-        "schema": "agentic.trace-replay.output-validation.v1",
+        "schema": "agentic.trace-replay.output-validation.v2",
         "expected_turns": expected_turns,
         "expected_tool_calls": expected_tool_calls,
         "observed_turns": len(per_turn) if isinstance(per_turn, list) else 0,
@@ -242,7 +232,7 @@ def validate_trace_output(
             "sandbox_reuse_ms": (lifecycle or {}).get("sandbox_reuse_ms"),
             "prewarm_status": (lifecycle or {}).get("prewarm_status"),
         },
-        "plots": plot_evidence,
+        "tables": table_evidence,
         "prometheus": {
             "cadvisor_success": (collect_manifest or {}).get("cadvisor_success"),
             "app_success": (collect_manifest or {}).get("app_success"),

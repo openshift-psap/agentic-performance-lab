@@ -7,7 +7,7 @@ from trace_replay_sim.functional_conformance import arguments_sha256, verify_tra
 
 def _make_trace(tmp_path: Path, *, wrong_hash: bool = False, wrong_tool: bool = False) -> Path:
     trace = tmp_path / "trace"
-    (trace / "data/shell/profile-v2/diagrams").mkdir(parents=True)
+    (trace / "data/shell/profile-v2/tables").mkdir(parents=True)
     (trace / "data/shell").mkdir(exist_ok=True)
     (trace / "data/appworld").mkdir(parents=True)
     session = {
@@ -22,7 +22,7 @@ def _make_trace(tmp_path: Path, *, wrong_hash: bool = False, wrong_tool: bool = 
         "\n".join(json.dumps({"session_id": "session-1", "turn_seq": i, "n_tool_calls": 1, "miss": False, "exhausted": False}) for i in range(2)) + "\n"
     )
     fields = ["turn", "prompt_boundary_ms", "sandbox_init_ms", "response_processing_ms", "tool_dispatch_overhead_ms", "openshell_exec_ms", "tool_failure_ms"]
-    with (trace / "data/shell/profile-v2/diagrams/per_turn_efficiency.csv").open("w", newline="") as handle:
+    with (trace / "data/shell/profile-v2/tables/per_turn_efficiency.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerow({"turn": 0, "prompt_boundary_ms": 10, "sandbox_init_ms": 20, "response_processing_ms": 0, "tool_dispatch_overhead_ms": 0, "openshell_exec_ms": 0, "tool_failure_ms": 0})
@@ -62,7 +62,7 @@ def test_functional_conformance_rejects_wrong_arguments(tmp_path):
 
 def test_swe_conformance_rejects_new_missing_dependency_even_with_zero_exit(tmp_path):
     trace = tmp_path / "swe-trace"
-    (trace / "data/shell/profile-v2/diagrams").mkdir(parents=True)
+    (trace / "data/shell/profile-v2/tables").mkdir(parents=True)
     (trace / "data/shell").mkdir(exist_ok=True)
     arguments = {"command": "python3 -m pytest tests/ | tail -3"}
     session = {"session_id": "swe-1", "swe_task": {"base_commit": "abc"},
@@ -75,7 +75,7 @@ def test_swe_conformance_rejects_new_missing_dependency_even_with_zero_exit(tmp_
     }) + "\n")
     fields = ["turn", "response_processing_ms", "tool_dispatch_overhead_ms",
               "openshell_exec_ms", "tool_failure_ms"]
-    with (trace / "data/shell/profile-v2/diagrams/per_turn_efficiency.csv").open("w", newline="") as handle:
+    with (trace / "data/shell/profile-v2/tables/per_turn_efficiency.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerow(dict.fromkeys(fields, 0))

@@ -16,6 +16,7 @@ the two must not be confused.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import statistics
 from pathlib import Path
@@ -24,6 +25,7 @@ from typing import Any
 
 PHASES = [
     "context_routing_parse_ms",
+    "context_assembly_ms",
     "response_processing_ms",
     "response_cycle_ms",
     "openclaw_response_only_ms",
@@ -83,7 +85,8 @@ def phase_row(row: dict[str, Any]) -> dict[str, Any]:
         "is_cold_sandbox": bool(row.get("is_cold_sandbox")),
         "context_routing_parse_ms": _number(row, "A_premodel_ms"),
         "response_processing_ms": _number(row, "D_response_ms"),
-        "context_assembly_ms": _number(row, "context_assembly_direct_ms"),
+        "context_assembly_ms": _number(row, "context_assembly_complete_ms"),
+        "context_assembly_direct_ms": _number(row, "context_assembly_direct_ms"),
         "response_processing_measured_ms": _number(row, "F_mock_last_to_tool_ms"),
         "response_cycle_ms": _number(row, "H_response_cycle_ms"),
         "openclaw_response_only_ms": _number(row, "H_openclaw_response_only_ms"),
@@ -125,6 +128,8 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             for phase in PHASES
         },
         "definitions": {
+            "context_assembly_ms": "OpenClaw tool or run boundary to receipt of the complete next request body at the model endpoint",
+            "context_assembly_direct_ms": "native OpenClaw context.assembled span, retained separately because it may be run-scoped",
             "first_event_to_tool_ms": "mock first model event to OpenClaw tool.execution span start",
             "response_processing_post_stream_ms": "mock final model event to OpenClaw tool.execution span start",
             "response_cycle_ms": "mock first model event to next mock prompt, excluding OpenShell execution",
@@ -162,6 +167,16 @@ def _write_report(summary: dict[str, Any], rows: list[dict[str, Any]], out: Path
     out.mkdir(parents=True, exist_ok=True)
     (out / "profile_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (out / "per_turn_phases.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    fields = list(dict.fromkeys(key for row in rows for key in row)) or ["session_id", "turn_seq", *PHASES]
+    with (out / "per_turn_phases.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    with (out / "phase_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("phase", "unit", "n", "mean", "p50", "p95", "min", "max"))
+        writer.writeheader()
+        for phase, stats in summary["phases"].items():
+            writer.writerow({"phase": phase, "unit": "ms", **stats})
     lines = ["# Multi-turn Harness Profile", "", f"Turns: {summary['turns']}", ""]
     lines += ["| Phase | Mean ms | P50 ms | P95 ms |", "|---|---:|---:|---:|"]
     for phase, stats in summary["phases"].items():
@@ -181,56 +196,6 @@ def _write_report(summary: dict[str, Any], rows: list[dict[str, Any]], out: Path
     (out / "PROFILE.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def render_plot(rows: list[dict[str, Any]], out: Path) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError as exc:  # pragma: no cover - optional analysis dependency
-        raise RuntimeError("Install the analyze extra to render profiler plots") from exc
-
-    out.mkdir(parents=True, exist_ok=True)
-    visible = [row for row in rows if row.get("turn_seq") is not None]
-    labels = [f"T{row['turn_seq']}" for row in visible]
-    x = list(range(len(visible)))
-    fig, ax = plt.subplots(figsize=(14, max(6, len(visible) * 0.24)))
-    left = [0.0] * len(visible)
-    colors = {
-        "model_stream_ms": "#8fa1b5",
-        "response_processing_post_stream_ms": "#20b486",
-        "openshell_exec_ms": "#8b5cf6",
-    }
-    for phase in ("model_stream_ms", "response_processing_post_stream_ms", "openshell_exec_ms"):
-        values = [row.get(phase) or 0.0 for row in visible]
-        ax.barh(x, values, left=left, color=colors[phase], label=phase)
-        left = [a + b for a, b in zip(left, values)]
-    ax.set_yticks(x, labels)
-    ax.set_xlabel("Milliseconds")
-    ax.set_title("Multi-turn Model Stream, OpenClaw Processing, and OpenShell Execution")
-    ax.legend(loc="lower right")
-    fig.tight_layout()
-    fig.savefig(out / "harness_phase_waterfall.png", dpi=160)
-    plt.close(fig)
-
-    stage_fig, stage_ax = plt.subplots(figsize=(14, max(6, len(visible) * 0.24)))
-    stage_left = [0.0] * len(visible)
-    stage_defs = [
-        ("context_assembly_ms", "Context assembly (direct span only)", "#3B82F6"),
-        ("sandbox_init_ms", "Sandbox initialization (cold only)", "#F59E0B"),
-        ("sandbox_exec_exclusive_ms", "Sandbox tool execution", "#8B5CF6"),
-        ("response_processing_measured_ms", "Response processing (post-decode)", "#10B981"),
-    ]
-    for phase, label, color in stage_defs:
-        values = [row.get(phase) or 0.0 for row in visible]
-        stage_ax.barh(x, values, 0.62, left=stage_left, color=color, label=label)
-        stage_left = [a + b for a, b in zip(stage_left, values)]
-    stage_ax.set_yticks(x, labels)
-    stage_ax.set_xlabel("Milliseconds")
-    stage_ax.set_title("Measured OpenClaw/OpenShell Stages (Decode Separated)")
-    stage_ax.legend(loc="lower right")
-    stage_fig.tight_layout()
-    stage_fig.savefig(out / "stage_only_waterfall.png", dpi=160)
-    plt.close(stage_fig)
-
-
 def profile(*, per_turn: Path, out: Path, driver_requests: Path | None = None,
             warm_only: bool = False) -> dict[str, Any]:
     rows = [phase_row(row) for row in load_rows(per_turn)]
@@ -240,7 +205,6 @@ def profile(*, per_turn: Path, out: Path, driver_requests: Path | None = None,
     requests = load_driver_requests(driver_requests)
     summary["driver_sse"] = summarize_driver_requests(requests)
     _write_report(summary, rows, out)
-    render_plot(rows, out / "diagrams")
     return summary
 
 

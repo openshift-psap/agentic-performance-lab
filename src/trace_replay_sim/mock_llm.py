@@ -758,7 +758,10 @@ def openai_tool_calls(
         name = item.get("name") or "true"
         if to_sandbox:
             name = "exec"
-            arguments = _sandbox_exec_args(item.get("mapped_command"), trace_id, run_key)
+            if item.get("swe_original_command"):
+                arguments = json.dumps({"command": str(item["swe_original_command"])})
+            else:
+                arguments = _sandbox_exec_args(item.get("mapped_command"), trace_id, run_key)
         elif not isinstance(arguments, str):
             arguments = json.dumps(arguments)
         encoded.append({
@@ -852,13 +855,16 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
             return
 
         # -- io helpers -------------------------------------------------------
-        def _read_json(self) -> dict[str, Any]:
+        def _read_json(self) -> tuple[dict[str, Any], int, int]:
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b"{}"
+            t_body_read_ns = time.perf_counter_ns()
+            t_body_read_wall_ns = time.time_ns()
             with index.lock:
                 index.stats["requests"] += 1
                 index.stats["bytes_in"] += len(raw)
-            return json.loads(raw.decode("utf-8")) if raw else {}
+            return (json.loads(raw.decode("utf-8")) if raw else {},
+                    t_body_read_ns, t_body_read_wall_ns)
 
         def _send(self, code: int, payload: dict[str, Any] | None) -> None:
             body = b"" if payload is None else json.dumps(payload).encode("utf-8")
@@ -874,7 +880,7 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
             self.wfile.flush()
 
         # -- streaming response with edge recording ---------------------------
-        def _sse(self, replay: dict[str, Any], model: str, traceparent: str, t_recv_ns: int, t_recv_wall_ns: int, payload: dict[str, Any]) -> None:
+        def _sse(self, replay: dict[str, Any], model: str, traceparent: str, t_recv_ns: int, t_recv_wall_ns: int, payload: dict[str, Any], t_body_read_ns: int, t_body_read_wall_ns: int) -> None:
             content = _assistant_content(replay)
             parsed_parent = parse_traceparent(traceparent)
             tool_calls_raw = openai_tool_calls(
@@ -1055,6 +1061,7 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
             self._record_and_span(
                 replay, traceparent, payload, mode="stream",
                 t_recv_ns=t_recv_ns, t_recv_wall_ns=t_recv_wall_ns,
+                t_body_read_ns=t_body_read_ns, t_body_read_wall_ns=t_body_read_wall_ns,
                 t_first_emit_ns=t_first_emit_ns, t_end_emit_ns=t_end_emit_ns,
                 ttft_s=ttft_s, itl_s=itl_s, decode_s=decode_s, profile=profile,
                 output_tokens=output_tokens, input_tokens=input_tokens,
@@ -1073,6 +1080,7 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
 
         # -- edge record + OTLP spans ----------------------------------------
         def _record_and_span(self, replay, traceparent, payload, *, mode, t_recv_ns, t_recv_wall_ns,
+                             t_body_read_ns, t_body_read_wall_ns,
                              t_first_emit_ns, t_end_emit_ns, ttft_s, itl_s, decode_s, profile,
                              output_tokens, input_tokens, recorded_ms, finish_reason, n_tool_calls,
                               reasoning_tokens=0, prefill_new_tokens=0, response_tail_ms=0.0,
@@ -1091,17 +1099,20 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                 "request_seq": next_request_seq(),
                 # single-clock edge timestamps (monotonic ns) + wall anchor
                 "t_recv_ns": t_recv_ns,
+                "t_body_read_ns": t_body_read_ns,
                 "t_first_emit_ns": t_first_emit_ns,
                 "t_first_visible_emit_ns": first_visible_emit_ns or t_first_emit_ns,
                 "t_first_tool_emit_ns": first_tool_emit_ns or t_end_emit_ns,
                 "t_end_emit_ns": t_end_emit_ns,
                 "t_recv_wall_ns": t_recv_wall_ns,
+                "t_body_read_wall_ns": t_body_read_wall_ns,
                 "t_first_emit_wall_ns": t_recv_wall_ns + (t_first_emit_ns - t_recv_ns),
                 "t_first_visible_emit_wall_ns": t_recv_wall_ns + ((first_visible_emit_ns or t_first_emit_ns) - t_recv_ns),
                 "t_first_tool_emit_wall_ns": t_recv_wall_ns + ((first_tool_emit_ns or t_end_emit_ns) - t_recv_ns),
                 "t_end_emit_wall_ns": t_recv_wall_ns + (t_end_emit_ns - t_recv_ns),
                 # measured durations (derived from the single clock)
-                "ttft_measured_ms": round((t_first_emit_ns - t_recv_ns) / 1e6, 3),
+                "request_body_read_ms": round((t_body_read_ns - t_recv_ns) / 1e6, 3),
+                "ttft_measured_ms": round((t_first_emit_ns - t_body_read_ns) / 1e6, 3),
                 "decode_measured_ms": round((t_end_emit_ns - t_first_emit_ns) / 1e6, 3),
                 # controlled inputs
                 "ttft_set_ms": round(ttft_s * 1000, 3),
@@ -1200,14 +1211,17 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
             t_recv_ns = time.perf_counter_ns()
             t_recv_wall_ns = time.time_ns()
             traceparent = self.headers.get("traceparent", "")
-            payload = self._read_json()
+            # The body-read timestamp is taken before JSON parsing, at the
+            # requested boundary: complete request bytes at the endpoint.
+            payload, t_body_read_ns, t_body_read_wall_ns = self._read_json()
             _tp = parse_traceparent(traceparent)
             replay = index.resolve(payload, mode=mode, trace_id=(_tp[0] if _tp else None))
             model = str(payload.get("model") or "replay")
 
             if path in {"/v1/chat/completions", "/chat/completions"}:
                 if payload.get("stream"):
-                    self._sse(replay, model, traceparent, t_recv_ns, t_recv_wall_ns, payload)
+                    self._sse(replay, model, traceparent, t_recv_ns, t_recv_wall_ns,
+                              payload, t_body_read_ns, t_body_read_wall_ns)
                     return
                 body = chat_completion(replay, model)
                 self._send(200, body)
@@ -1215,6 +1229,7 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                 self._record_and_span(
                     replay, traceparent, payload, mode="unary",
                     t_recv_ns=t_recv_ns, t_recv_wall_ns=t_recv_wall_ns,
+                    t_body_read_ns=t_body_read_ns, t_body_read_wall_ns=t_body_read_wall_ns,
                     t_first_emit_ns=t_end_ns, t_end_emit_ns=t_end_ns,
                     ttft_s=0.0, itl_s=0.0, decode_s=0.0, profile="unary",
                     output_tokens=int(replay.get("output_tokens") or 0),
@@ -1230,6 +1245,7 @@ def make_handler(index: ReplayIndex, recorder: EdgeRecorder, *, mode: str, timin
                 self._record_and_span(
                     replay, traceparent, payload, mode="unary",
                     t_recv_ns=t_recv_ns, t_recv_wall_ns=t_recv_wall_ns,
+                    t_body_read_ns=t_body_read_ns, t_body_read_wall_ns=t_body_read_wall_ns,
                     t_first_emit_ns=t_end_ns, t_end_emit_ns=t_end_ns,
                     ttft_s=0.0, itl_s=0.0, decode_s=0.0, profile="unary",
                     output_tokens=int(replay.get("output_tokens") or 0),

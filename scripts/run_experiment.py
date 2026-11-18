@@ -40,9 +40,6 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
-# The controller collects traces concurrently; plotting must never try to
-# initialize the macOS GUI backend from a worker thread.
-os.environ.setdefault("MPLBACKEND", "Agg")
 
 # Baseline objects are explicitly owned by this benchmark. Run-scoped objects
 # use an additional hash suffix; these names are template/telemetry services
@@ -142,7 +139,7 @@ from trace_replay_sim.workloads import (
     select_tool_rich_sessions,
     split_corpus,
 )
-from generate_appworld_plots import plot_events as plot_appworld_events
+from trace_replay_sim.measurement_tables import write_backend_calls
 
 LOG = logging.getLogger("run-experiment")
 TRANSIENT_API_MARKERS = (
@@ -807,6 +804,58 @@ def ensure_shared_workspace(
     log_phase(f"storage: shared {access_mode} workspace ready ({pvc_name}, {len(workspace_names)} subpaths)")
 
 
+def _swe_task_runtime_preflight_code(task: dict[str, Any]) -> str:
+    """Select a working Python from this task image before measured replay.
+
+    The source checkout is pinned separately from the image, so require the
+    selected interpreter to resolve the project from that checkout rather
+    than silently importing the image's original /testbed tree.
+    """
+    identity = json.dumps({
+        "base_commit": str(task.get("base_commit") or ""),
+        "image": str(task.get("image") or ""),
+        "module": str(task.get("repo") or "").rsplit("/", 1)[-1].replace("-", "_"),
+    })
+    return (
+        "import importlib.util,json,os,shutil,subprocess,sys\n"
+        f"task={identity}\n"
+        "root='/sandbox/.openshell/workspace'\n"
+        "head=subprocess.run(['git','-c','safe.directory='+root,'-C',root,'rev-parse','HEAD'],capture_output=True,text=True,check=False)\n"
+        "if head.returncode or head.stdout.strip()!=task['base_commit']: raise RuntimeError('SWE runtime preflight: checkout does not match task base commit')\n"
+        "candidates=['/opt/miniconda3/envs/testbed/bin/python','/opt/conda/envs/testbed/bin/python','/opt/miniconda/envs/testbed/bin/python','/opt/venv/bin/python','/venv/bin/python','/usr/local/bin/python3','/usr/bin/python3']\n"
+        "system=shutil.which('python3')\n"
+        "if system: candidates.append(system)\n"
+        "probe=\"import importlib.util,json,os,sys; s=importlib.util.find_spec(sys.argv[1]); print(json.dumps({'origin':s.origin if s else None,'locations':list(s.submodule_search_locations or []) if s else [],'version':sys.version.split()[0]}))\"\n"
+        "env=os.environ.copy();env['PYTHONPATH']=':'.join((root,os.path.join(root,'src'),os.path.join(root,'lib')))\n"
+        "errors=[];chosen=None\n"
+        "for python in dict.fromkeys(candidates):\n"
+        " if not os.path.isfile(python) or not os.access(python,os.X_OK): continue\n"
+        " try: result=subprocess.run([python,'-c',probe,task['module']],cwd=root,env=env,capture_output=True,text=True,timeout=30,check=False)\n"
+        " except (OSError,subprocess.TimeoutExpired) as exc: errors.append(python+': '+str(exc)); continue\n"
+        " if result.returncode: errors.append(python+': '+result.stderr.strip()[-400:]); continue\n"
+        " try: details=json.loads(result.stdout.strip())\n"
+        " except ValueError: errors.append(python+': invalid probe output'); continue\n"
+        " paths=[details.get('origin') or '']+details.get('locations',[])\n"
+        " if not any(path and os.path.realpath(path).startswith(os.path.realpath(root)+os.sep) for path in paths):\n"
+        "  errors.append(python+': project resolves outside pinned checkout'); continue\n"
+        " chosen={'python':python,'python_version':details['version'],'module':task['module'],'module_origin':details.get('origin'),'base_commit':task['base_commit'],'image':task['image']}\n"
+        " break\n"
+        "if chosen is None: raise RuntimeError('SWE task image has no Python that resolves the pinned project: '+'; '.join(errors))\n"
+        "shim='/tmp/trace-replay-swe-python-bin'\n"
+        "os.makedirs(shim,exist_ok=True)\n"
+        "os.chmod(shim,0o755)\n"
+        "for name in ('python','python3'):\n"
+        " link=os.path.join(shim,name)\n"
+        " if os.path.lexists(link): os.unlink(link)\n"
+        " os.symlink(chosen['python'],link)\n"
+        "chosen['path_prefix']=shim+':'+os.path.dirname(chosen['python'])\n"
+        "path='/tmp/trace-replay-swe-runtime.json'\n"
+        "with open(path,'w',encoding='utf-8') as handle: json.dump(chosen,handle)\n"
+        "os.chmod(path,0o644)\n"
+        "print(json.dumps(chosen))\n"
+    )
+
+
 def stage_swe_repositories(
     cluster: Cluster,
     openshell_ns: str,
@@ -818,16 +867,15 @@ def stage_swe_repositories(
     staging_node: str | None = None,
     checkpoint_dir: Path | None = None,
     scripts_by_agent: dict[int, Path] | None = None,
+    task_image_runtime: bool = False,
 ) -> None:
     """Copy real SWE task snapshots into the agent's shared workspace.
 
-    SWE-bench task images contain the repository, but they are not guaranteed
-    to contain OpenShell's trusted ``ip`` helper.  Running those images
-    directly as OpenShell sandboxes therefore fails during network namespace
-    setup.  The task image is used only as a short-lived, node-pinned staging
-    container; OpenShell then runs its supported sandbox image against the
-    staged repository on the RWX workspace.  The copied HEAD is checked
-    against the manifest before the staging job is accepted.
+    The exact trajectory base commit is fetched and staged separately from
+    the image. In task-image mode, compiled extensions and generated version
+    modules from the image are copied where the package directories exist;
+    the runtime preflight then verifies that Python resolves the pinned
+    checkout. This is replay setup, not timed tool work.
     """
     if not tasks_by_agent:
         return
@@ -841,7 +889,7 @@ def stage_swe_repositories(
         workspace = workspace_names[agent_index]
         node = agent_nodes[agent_index]
         checkpoint = (checkpoint_dir / "swe-staging" / f"{agent_index + 1:03d}.json") if checkpoint_dir else None
-        if checkpoint and not scripts_by_agent and _staged_repository_is_valid(
+        if checkpoint and not scripts_by_agent and not task_image_runtime and _staged_repository_is_valid(
             cluster,
             openshell_ns,
             workspace,
@@ -852,6 +900,15 @@ def stage_swe_repositories(
             log_phase(f"SWE repository staging already verified; reusing agent {agent_index + 1}")
             return
         job = f"{RESOURCE_PREFIX}-swe-stage-{run_hash}-{agent_index + 1:03d}"
+        extension_copy = (
+            "python3 -c 'import os,shutil;src=\"/testbed\";dst=\"/stage/repo\";"
+            "files=[os.path.join(root,name) for root,_,names in os.walk(src) for name in names "
+            "if name.endswith(\".so\") or name==\"_version.py\"];"
+            "[shutil.copy2(path,os.path.join(dst,os.path.relpath(path,src))) for path in files "
+            "if os.path.isdir(os.path.dirname(os.path.join(dst,os.path.relpath(path,src)))) "
+            "and (path.endswith(\".so\") or not os.path.exists(os.path.join(dst,os.path.relpath(path,src))))]'; "
+            if task_image_runtime else ""
+        )
         command = (
             "set -eux; "
             "export GIT_CONFIG_GLOBAL=/tmp/trace-replay-gitconfig; "
@@ -870,6 +927,7 @@ def stage_swe_repositories(
             f"git -C \"$stage_root\" fetch --no-tags --depth=1 origin {shlex.quote(commit)}; "
             "git -C \"$stage_root\" checkout --detach FETCH_HEAD; "
             f"test \"$(git -C \"$stage_root\" rev-parse HEAD)\" = \"{commit}\"; "
+            f"{extension_copy}"
             "touch /stage/ready; sleep 1800"
         )
         job_obj = {
@@ -1006,6 +1064,25 @@ def stage_swe_repositories(
                 raise RuntimeError(
                     f"SWE sandbox repository mismatch for agent {agent_index + 1}: expected {commit}, observed {observed or '<empty>'}"
                 )
+            runtime: dict[str, Any] | None = None
+            if task_image_runtime:
+                runtime_code = _swe_task_runtime_preflight_code(task)
+                runtime_result = cluster.run(
+                    ["-n", openshell_ns, "exec", sandbox_pod, "-c", sandbox_container,
+                     "--", "python3", "-c", runtime_code],
+                ).strip()
+                try:
+                    runtime = json.loads(runtime_result)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"SWE task-image runtime preflight failed for agent {agent_index + 1}: {runtime_result[-2000:]}"
+                    ) from exc
+                if runtime.get("base_commit") != commit or runtime.get("image") != image:
+                    raise RuntimeError(f"SWE task-image runtime identity mismatch for agent {agent_index + 1}")
+                log_phase(
+                    f"SWE agent {agent_index + 1}: task Python {runtime['python_version']} "
+                    f"resolves {runtime['module']} from pinned checkout"
+                )
             script_dir = (scripts_by_agent or {}).get(agent_index)
             if script_dir is not None:
                 scripts = sorted(script_dir.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9][0-9].py"))
@@ -1045,6 +1122,7 @@ def stage_swe_repositories(
                             "workspace": workspace,
                             "node": node,
                             "base_commit": commit,
+                            "task_image_runtime": runtime,
                             "verified_at": datetime.now(timezone.utc).isoformat(),
                         },
                         indent=2,
@@ -1689,6 +1767,9 @@ def _collect_backend_events(
     session_id: str,
     start: float,
     trace_ids: set[str],
+    *,
+    run_key: str = "",
+    end: float | None = None,
 ) -> list[dict[str, Any]]:
     """Collect only the current session from the resolved backend deployment.
 
@@ -1708,7 +1789,15 @@ def _collect_backend_events(
         # are admissible; choose the latest matching duplicate.
         latest: dict[tuple[Any, Any, str], dict[str, Any]] = {}
         for event in candidates:
-            if str(event.get("trace_id") or "") not in trace_ids:
+            event_trace_id = str(event.get("trace_id") or "")
+            event_run_key = str(event.get("run_key") or "")
+            trace_matches = bool(event_trace_id and event_trace_id in trace_ids)
+            run_matches = bool(
+                not event_trace_id and run_key and event_run_key == run_key
+                and end is not None
+                and (start - 5.0) * 1e9 <= int(event.get("timestamp_unix_ns") or 0) <= (end + 5.0) * 1e9
+            )
+            if not (trace_matches or run_matches):
                 continue
             key = (event.get("turn"), event.get("call"), str(event.get("tool") or ""))
             previous = latest.get(key)
@@ -2513,6 +2602,25 @@ def _rewrite_queue_backend_endpoints(
                 script.write_text(source, encoding="utf-8")
 
 
+def _swe_command_map(session: dict[str, Any]) -> dict[str, list[str]]:
+    """Index recorded bash commands to prepared scripts for the SSH boundary."""
+    mapping: dict[str, list[str]] = {}
+    for turn in session.get("turns") or []:
+        for tool in turn.get("tool_calls") or []:
+            original = tool.get("swe_original_command")
+            mapped = tool.get("mapped_command")
+            if not isinstance(original, str) or not original:
+                continue
+            if not isinstance(mapped, list) or len(mapped) != 2 or mapped[0] != "python3":
+                raise ValueError("SWE original command has no prepared execution script")
+            script = str(mapped[1])
+            if not re.fullmatch(r"/tmp/trace-replay-tool-calls/[0-9]{4}-[0-9]{3}\.py", script):
+                raise ValueError(f"invalid SWE execution script: {script}")
+            digest = hashlib.sha256(original.encode("utf-8")).hexdigest()
+            mapping.setdefault(digest, []).append(script)
+    return mapping
+
+
 def _clone_config(
     cluster: Cluster,
     source: str,
@@ -2680,6 +2788,7 @@ def deploy_agents(
     agent_nodes: list[str] | tuple[str, ...] | None = None,
     shared_workspace_pvcs: dict[str, str] | None = None,
     sandbox_images: list[str | None] | None = None,
+    swe_command_maps: list[dict[str, list[str]] | None] | None = None,
     agent_indices: list[int] | tuple[int, ...] | None = None,
     reconcile_indices: list[int] | tuple[int, ...] | None = None,
     reuse_existing_workspaces: bool = False,
@@ -2693,6 +2802,8 @@ def deploy_agents(
         raise ValueError("agent_nodes must contain exactly one node assignment per agent")
     if sandbox_images is not None and len(sandbox_images) != agents:
         raise ValueError("sandbox_images must contain exactly one image assignment per agent")
+    if swe_command_maps is not None and len(swe_command_maps) != agents:
+        raise ValueError("swe_command_maps must contain exactly one mapping per agent")
     global_indices = tuple(agent_indices or range(1, agents + 1))
     if len(global_indices) != agents or len(set(global_indices)) != agents or any(index < 1 for index in global_indices):
         raise ValueError("agent_indices must contain unique positive global agent indices")
@@ -2785,6 +2896,104 @@ def deploy_agents(
             return True
         raise RuntimeError("base OpenClaw deployment has no init-config container")
 
+    def install_swe_preflight_allowlist(
+        deployment_obj: dict[str, Any], command_map: dict[str, list[str]] | None
+    ) -> bool:
+        """Permit only corpus-pinned SWE commands past OpenClaw's exec guards.
+
+        OpenClaw still receives each original bash command and routes exec to
+        its OpenShell sandbox. The SSH adapter then maps the command to its
+        staged script. The pinned 2026.8.1-beta.2 bundle otherwise rejects
+        recorded heredoc/interpreter combinations and rejects two recorded
+        shell strings with unclosed quotes before the adapter runs. The
+        experiment-owned overlay changes these guards only for exact command
+        hashes present in this session's validated command map. The original
+        shell string is never executed: the SSH adapter selects its script.
+        """
+        if not command_map:
+            return False
+        hashes = sorted(command_map)
+        if not all(re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes):
+            raise ValueError("invalid SWE command hash allowlist")
+        spec = deployment_obj["spec"]["template"]["spec"]
+        bundle = "bash-tools-BoFtiF3w.js"
+        volume_name = "swe-preflight-patch"
+        if not any(volume.get("name") == volume_name for volume in spec.get("volumes", [])):
+            spec.setdefault("volumes", []).append({"name": volume_name, "emptyDir": {}})
+        patch_program = """
+const fs = require("node:fs");
+const source = "/app/dist/bash-tools-BoFtiF3w.js";
+const destination = "/swe-preflight-patch/bash-tools-BoFtiF3w.js";
+let code = fs.readFileSync(source, "utf8");
+const needle = 'if (hasInterpreterInvocation && hasComplexSyntax && (hasInterpreterSegmentScriptHint || hasInterpreterPipelineScriptHint || hasProcessSubstitution && isDirectInterpreterCommand)) throw new Error("exec preflight:';
+const replacement = 'if (hasInterpreterInvocation && hasComplexSyntax && (hasInterpreterSegmentScriptHint || hasInterpreterPipelineScriptHint || hasProcessSubstitution && isDirectInterpreterCommand) && !String(process.env.TRACE_REPLAY_SWE_ALLOWED_COMMAND_HASHES || "").split(",").includes(crypto.createHash("sha256").update(params.command).digest("hex"))) throw new Error("exec preflight:';
+if (code.split(needle).length !== 2) throw new Error("pinned OpenClaw preflight bundle changed");
+code = code.replace(needle, replacement);
+fs.writeFileSync(destination, code);
+const sshSource = "/app/dist/ssh-backend-Bu8TBAEJ.js";
+const sshDestination = "/swe-preflight-patch/ssh-backend-Bu8TBAEJ.js";
+let sshCode = fs.readFileSync(sshSource, "utf8");
+const sshNeedle = 'function buildValidatedExecRemoteCommand(params) {\n\tassertValidExecRemoteCommand(params.command);';
+const sshReplacement = 'function buildValidatedExecRemoteCommand(params) {\n\tif (!String(process.env.TRACE_REPLAY_SWE_ALLOWED_COMMAND_HASHES || "").split(",").includes(hashTextSha256(params.command))) assertValidExecRemoteCommand(params.command);';
+if (sshCode.split(sshNeedle).length !== 2) throw new Error("pinned OpenClaw SSH backend changed");
+sshCode = sshCode.replace(sshNeedle, sshReplacement);
+fs.writeFileSync(sshDestination, sshCode);
+"""
+        marker = "# trace-replay-swe-preflight-allowlist-v1"
+        for container in spec.get("initContainers", []):
+            if container.get("name") != "init-config":
+                continue
+            mounts = container.setdefault("volumeMounts", [])
+            if not any(mount.get("name") == volume_name for mount in mounts):
+                mounts.append({"name": volume_name, "mountPath": "/swe-preflight-patch"})
+            args = container.setdefault("args", [""])
+            command = str(args[0] if args else "")
+            if marker not in command:
+                anchor = "node openclaw.mjs doctor"
+                anchor_pos = command.find(anchor)
+                if anchor_pos < 0:
+                    raise RuntimeError("base OpenClaw init-config has no doctor step")
+                line_start = command.rfind("\n", 0, anchor_pos) + 1
+                insertion = marker + "\nnode <<'TRACE_REPLAY_SWE_PATCH'\n" + patch_program + "\nTRACE_REPLAY_SWE_PATCH\n"
+                args[0] = command[:line_start] + insertion + command[line_start:]
+            break
+        else:
+            raise RuntimeError("base OpenClaw deployment has no init-config container")
+        for container in spec.get("containers", []):
+            if container.get("name") != "gateway":
+                continue
+            if container.get("image") != EXPERIMENT_OPENCLAW_IMAGE:
+                raise RuntimeError("SWE preflight overlay requires the pinned OpenClaw image")
+            env = container.setdefault("env", [])
+            env[:] = [item for item in env if item.get("name") != "TRACE_REPLAY_SWE_ALLOWED_COMMAND_HASHES"]
+            env.append({"name": "TRACE_REPLAY_SWE_ALLOWED_COMMAND_HASHES", "value": ",".join(hashes)})
+            mounts = container.setdefault("volumeMounts", [])
+            if not any(mount.get("name") == volume_name for mount in mounts):
+                mounts.append({
+                    "name": volume_name,
+                    "mountPath": f"/app/dist/{bundle}",
+                    "subPath": bundle,
+                    "readOnly": True,
+                })
+            ssh_bundle = "ssh-backend-Bu8TBAEJ.js"
+            if not any(mount.get("mountPath") == f"/app/dist/{ssh_bundle}" for mount in mounts):
+                mounts.append({
+                    "name": volume_name,
+                    "mountPath": f"/app/dist/{ssh_bundle}",
+                    "subPath": ssh_bundle,
+                    "readOnly": True,
+                })
+            break
+        else:
+            raise RuntimeError("base OpenClaw deployment has no gateway container")
+        annotation = "trace-replay.openai.com/swe-preflight-hashes"
+        revision = hashlib.sha256(",".join(hashes).encode()).hexdigest()
+        metadata = deployment_obj["spec"]["template"].setdefault("metadata", {})
+        annotations = metadata.setdefault("annotations", {})
+        changed = annotations.get(annotation) != revision
+        annotations[annotation] = revision
+        return changed
+
     def node_for(index: int) -> str:
         return planned_nodes[index - 1]
 
@@ -2793,6 +3002,9 @@ def deploy_agents(
 
     def sandbox_image_for(index: int) -> str | None:
         return sandbox_images[index - 1] if sandbox_images is not None else None
+
+    def swe_command_map_for(index: int) -> dict[str, list[str]] | None:
+        return swe_command_maps[index - 1] if swe_command_maps is not None else None
 
     def workspace_pvc_for(node: str) -> str | None:
         if shared_workspace_pvcs:
@@ -2848,6 +3060,7 @@ def deploy_agents(
         cli_changed = pin_openshell_cli_version(deployment_obj)
         plugin_changed = pin_openshell_plugin_version(deployment_obj)
         sidecar_changed = install_local_mock_sidecar(deployment_obj)
+        preflight_changed = install_swe_preflight_allowlist(deployment_obj, swe_command_map_for(index))
         template = deployment_obj.setdefault("spec", {}).setdefault("template", {})
         template_metadata = template.setdefault("metadata", {})
         template_annotations = template_metadata.setdefault("annotations", {})
@@ -2871,6 +3084,7 @@ def deploy_agents(
                 internal_api_endpoints=internal_api_endpoints,
                 gateway_endpoint=gateway_endpoint,
                 sandbox_image=sandbox_image_for(index),
+                swe_command_map=swe_command_map_for(index),
                 sandbox_cpu_limit=sandbox_cpu_limit,
             )
         for container in template_spec.get("containers", []):
@@ -2888,7 +3102,7 @@ def deploy_agents(
             else:
                 workspace_entry["value"] = workspace
         cluster.apply_json(deployment_obj)
-        return shim_changed or config_hash_changed or sidecar_changed or cli_changed or plugin_changed or startup_changed
+        return shim_changed or config_hash_changed or sidecar_changed or cli_changed or plugin_changed or startup_changed or preflight_changed
 
     if reuse and deployment_prefix:
         # A recovery run may reuse one explicitly named, experiment-owned
@@ -2963,7 +3177,7 @@ def deploy_agents(
             # otherwise it can try to exec into a gateway container that is
             # still in init (or no longer exists).
             wrapper_needs_rollout = (
-                "trace-replay-openshell-node-selector-v30-" not in init_config_text
+                "trace-replay-openshell-node-selector-v31-" not in init_config_text
                 or "sleep 2147483647" not in init_config_text
                 or "openshell-pinned" not in "\n".join(
                     str(container)
@@ -3170,6 +3384,7 @@ def deploy_agents(
         install_plugin_compat_shim(deployment)
         pin_openshell_cli_version(deployment)
         pin_openshell_plugin_version(deployment)
+        install_swe_preflight_allowlist(deployment, swe_command_map_for(index))
         if not allow_cross_node:
             _install_pinned_openshell_wrapper(
                 deployment,
@@ -3180,6 +3395,7 @@ def deploy_agents(
                 internal_api_endpoints=internal_api_endpoints,
                 gateway_endpoint=gateway_endpoint,
                 sandbox_image=sandbox_image_for(index),
+                swe_command_map=swe_command_map_for(index),
                 sandbox_cpu_limit=sandbox_cpu_limit,
             )
         cluster.apply_json(deployment)
@@ -3376,6 +3592,7 @@ def _install_pinned_openshell_wrapper(
     gateway_endpoint: str | None = None,
     sandbox_image: str | None = None,
     sandbox_cpu_limit: str | None = None,
+    swe_command_map: dict[str, list[str]] | None = None,
 ) -> bool:
     """Install a wrapper that pins and storage-wires sandbox pods at create time."""
     kubernetes_config: dict[str, Any] = {
@@ -3443,6 +3660,12 @@ def _install_pinned_openshell_wrapper(
             "      - path: /usr/local/bin/python3.*\n"
             "      - path: /opt/conda/bin/python3\n"
             "      - path: /opt/conda/bin/python3.*\n"
+            "      - path: /opt/conda/envs/testbed/bin/python3\n"
+            "      - path: /opt/conda/envs/testbed/bin/python3.*\n"
+            "      - path: /opt/miniconda3/bin/python3\n"
+            "      - path: /opt/miniconda3/bin/python3.*\n"
+            "      - path: /opt/miniconda3/envs/testbed/bin/python3\n"
+            "      - path: /opt/miniconda3/envs/testbed/bin/python3.*\n"
         )
     policy_yaml = ""
     if network_policies:
@@ -3455,6 +3678,11 @@ def _install_pinned_openshell_wrapper(
             "    - /lib\n"
             "    - /etc\n"
             "    - /app\n"
+            "    - /opt/miniconda3\n"
+            "    - /opt/miniconda\n"
+            "    - /opt/conda\n"
+            "    - /opt/venv\n"
+            "    - /venv\n"
             "    - /var/log\n"
             "    - /proc\n"
             "    - /dev/urandom\n"
@@ -3479,6 +3707,7 @@ def _install_pinned_openshell_wrapper(
             gateway_endpoint or "",
             sandbox_image or "",
             sandbox_cpu_limit or "",
+            json.dumps(swe_command_map or {}, sort_keys=True),
         )).encode()
     ).hexdigest()[:12]
     # Bump the marker whenever wrapper semantics change so a reused agent
@@ -3504,7 +3733,7 @@ def _install_pinned_openshell_wrapper(
     # v30 makes file uploads copy into the destination directory (0.0.116
     # otherwise replaces a directory with the uploaded file, corrupting the
     # OpenClaw workspace seed).
-    marker = f"# trace-replay-openshell-node-selector-v30-{wrapper_fingerprint}"
+    marker = f"# trace-replay-openshell-node-selector-v31-{wrapper_fingerprint}"
     policy_injection = ""
     if policy_yaml:
         policy_injection = (
@@ -3623,6 +3852,17 @@ cp "$tmp/root/usr/bin/ssh" /opt/openshell/bin/ssh
 chmod 755 /opt/openshell/bin/ssh
 /opt/openshell/bin/ssh -V
 """
+    if swe_command_map:
+        adapter_path = Path(__file__).with_name("swe_ssh_adapter.cjs")
+        adapter_source = adapter_path.read_text(encoding="utf-8")
+        encoded_map = base64.b64encode(json.dumps(swe_command_map, sort_keys=True).encode()).decode()
+        adapter_source = adapter_source.replace("__SWE_MAP_BASE64__", encoded_map)
+        ssh_install_script += (
+            "mv /opt/openshell/bin/ssh /opt/openshell/bin/ssh-real\n"
+            "cat > /opt/openshell/bin/ssh <<'TRACE_REPLAY_SWE_SSH_ADAPTER'\n"
+            + adapter_source + "\nTRACE_REPLAY_SWE_SSH_ADAPTER\n"
+            "chmod 755 /opt/openshell/bin/ssh\n"
+        )
     init_containers = deployment["spec"]["template"]["spec"].setdefault("initContainers", [])
     init_containers[:] = [
         item for item in init_containers
@@ -3644,6 +3884,7 @@ chmod 755 /opt/openshell/bin/ssh
         endpoint_literal = json.dumps(gateway_endpoint)
         endpoint_cert_key = re.sub(r"[^A-Za-z0-9._-]", "_", gateway_endpoint)
         endpoint_cert_dir = f"/home/node/.config/openshell/gateways/{endpoint_cert_key}/mtls"
+        alias_cert_dir = f"/home/node/.config/openshell/gateways/{OPENSHELL_GATEWAY_NAME}/mtls"
         endpoint_cert_marker = (
             "# trace-replay-openshell-endpoint-certs-v2-"
             + hashlib.sha256(gateway_endpoint.encode("utf-8")).hexdigest()[:10]
@@ -3688,8 +3929,11 @@ chmod 755 /opt/openshell/bin/ssh
                 mtls_setup = "\n".join([
                     endpoint_cert_marker,
                     f'mkdir -p "{endpoint_cert_dir}"',
+                    f'mkdir -p "{alias_cert_dir}"',
                     f'cp /openshell-mtls/ca.crt /openshell-mtls/tls.crt /openshell-mtls/tls.key "{endpoint_cert_dir}/"',
+                    f'cp /openshell-mtls/ca.crt /openshell-mtls/tls.crt /openshell-mtls/tls.key "{alias_cert_dir}/"',
                     f'chmod 600 "{endpoint_cert_dir}/tls.key"',
+                    f'chmod 600 "{alias_cert_dir}/tls.key"',
                 ])
                 # Older OpenShell-enabled agent deployments materialize a
                 # gateway alias directly instead of assigning `EP` and using
@@ -3727,6 +3971,7 @@ chmod 755 /opt/openshell/bin/ssh
                 if registry_marker not in updated_arg:
                     registry_line = " ".join([
                         "timeout 30s /opt/openshell/bin/openshell gateway add",
+                        "--local",
                         f"--name {shlex.quote(OPENSHELL_GATEWAY_NAME)}",
                         shlex.quote(gateway_endpoint),
                         ">/dev/null 2>&1",
@@ -4031,6 +4276,10 @@ def _swe_sandbox_command(
     task: SweTask,
     tool_cpu_ids: tuple[int, ...] = (),
     tool_cgroup_quota: str = "",
+    use_task_image_runtime: bool = False,
+    run_key: str = "",
+    locale_override: str = "",
+    recorded_temp_paths: tuple[str, ...] = (),
 ) -> list[str]:
     """Execute the recorded SWE command in an OpenShell sandbox with a staged checkout.
 
@@ -4049,13 +4298,17 @@ def _swe_sandbox_command(
         "swe_task": task.public_dict(),
         "tool_cpu_ids": list(tool_cpu_ids),
         "tool_cgroup_quota": tool_cgroup_quota,
+        "use_task_image_runtime": use_task_image_runtime,
+        "run_key": run_key,
+        "locale_override": locale_override,
+        "recorded_temp_paths": list(recorded_temp_paths),
     }, separators=(",", ":")).encode()).decode()
     endpoint_literal = json.dumps(endpoint.rstrip("/"))
     code = (
-        "import base64,glob,json,os,resource,subprocess,sys,time,urllib.request,urllib.error;"
+        "import base64,glob,json,os,re,resource,shlex,subprocess,sys,time,urllib.request,urllib.error;"
         f"p=json.loads(base64.b64decode('{payload}'));"
         "p['trace_id']=os.environ.get('TRACE_REPLAY_TRACE_ID','');"
-        "p['run_key']=os.environ.get('TRACE_REPLAY_RUN_KEY','');"
+        "p['run_key']=os.environ.get('TRACE_REPLAY_RUN_KEY') or p.get('run_key','');"
         "a=p.get('arguments') or {};task=p.get('swe_task') or {};tool_name=str(p.get('tool') or '');"
         "command=str(a.get('command') or a.get('cmd') or '');"
         "repo_root='/sandbox/.openshell/workspace'\n"
@@ -4070,6 +4323,19 @@ def _swe_sandbox_command(
         " verified_base_commit=head.stdout.strip()\n"
         " if command:\n"
         "  command=command.replace('/testbed',repo_root)\n"
+        "  temp_map_path='/tmp/trace-replay-swe-temp-map-'+str(p.get('run_key') or '')+'.json'\n"
+        "  try:\n   with open(temp_map_path,encoding='utf-8') as handle: temp_map=json.load(handle)\n"
+        "  except (OSError,ValueError): temp_map={}\n"
+        "  for recorded_path,actual_path in sorted(temp_map.items(),key=lambda item:-len(item[0])):\n"
+        "   if os.path.isdir(actual_path): command=command.replace(recorded_path,actual_path)\n"
+        "  if p.get('use_task_image_runtime'):\n"
+        "   with open('/tmp/trace-replay-swe-runtime.json',encoding='utf-8') as handle: runtime=json.load(handle)\n"
+        "   if runtime.get('base_commit') != task.get('base_commit') or runtime.get('image') != task.get('image'):\n"
+        "    raise RuntimeError('SWE task-image runtime does not match the selected task')\n"
+        "   python_bin=runtime['python'];repo_src=os.path.join(repo_root,'src');repo_lib=os.path.join(repo_root,'lib')\n"
+        "   runtime_path=runtime['path_prefix'];command='export PATH='+shlex.quote(runtime_path)+':$PATH; export PYTHONPATH='+shlex.quote(':'.join((repo_root,repo_src,repo_lib)))+':$PYTHONPATH; '+command\n"
+        "  if p.get('locale_override') == 'C':\n"
+        "   command='export LANG=C LC_ALL=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0; '+command\n"
         "  requested=set(int(cpu) for cpu in p.get('tool_cpu_ids') or [])\n"
         "  original=os.sched_getaffinity(0)\n"
         "  if requested and not requested.issubset(original):\n"
@@ -4115,6 +4381,13 @@ def _swe_sandbox_command(
         "   before=resource.getrusage(resource.RUSAGE_CHILDREN)\n"
         "   started_epoch_ns=time.time_ns();started_ns=time.monotonic_ns()\n"
         "   completed=subprocess.run(['bash','-lc',command],cwd=cwd,capture_output=True,text=True,timeout=180,check=False)\n"
+        "   command_output=completed.stdout+completed.stderr\n"
+        "   recorded_paths=list(dict.fromkeys(p.get('recorded_temp_paths') or []))\n"
+        "   actual_paths=list(dict.fromkeys(re.findall(r'/tmp/tmp[A-Za-z0-9_-]+',command_output)))\n"
+        "   if completed.returncode == 0 and len(recorded_paths) == len(actual_paths) == 1 and os.path.isdir(actual_paths[0]):\n"
+        "    temp_map[recorded_paths[0]]=actual_paths[0]\n"
+        "    with open(temp_map_path,'w',encoding='utf-8') as handle: json.dump(temp_map,handle)\n"
+        "   for recorded_path,actual_path in temp_map.items(): command_output=command_output.replace(actual_path,recorded_path)\n"
         "   ended_ns=time.monotonic_ns();ended_epoch_ns=time.time_ns()\n"
         "   after=resource.getrusage(resource.RUSAGE_CHILDREN)\n"
         "  finally:\n"
@@ -4123,7 +4396,7 @@ def _swe_sandbox_command(
         "  def _cg_delta(key):\n"
         "   if key in before_cg and key in after_cg: return after_cg[key]-before_cg[key]\n"
         "   return None\n"
-        "  result={'output':(completed.stdout+completed.stderr)[-64000:],'returncode':completed.returncode,'operation':'command',"
+        "  result={'output':command_output[-64000:],'returncode':completed.returncode,'operation':'command',"
         "'command_started_epoch_ns':started_epoch_ns,'command_ended_epoch_ns':ended_epoch_ns,"
         "'command_wall_ns':ended_ns-started_ns,'command_user_cpu_us':round((after.ru_utime-before.ru_utime)*1000000),"
         "'command_system_cpu_us':round((after.ru_stime-before.ru_stime)*1000000),"
@@ -4171,9 +4444,11 @@ def prepare_workload_corpus(
     selected_session_ids: set[str] | None = None,
     tool_cpu_ids: tuple[int, ...] = (),
     tool_cgroup_quota: str = "",
+    swe_task_image_runtime: bool = False,
 ) -> Path:
     """Map selected trace tools to the resolved backend API boundaries."""
     payload = json.loads(source.read_text(encoding="utf-8"))
+    swe_run_key = hashlib.sha256(str(out.parent.resolve()).encode("utf-8")).hexdigest()[:32]
     if selected_session_ids is not None:
         payload["sessions"] = [
             session for session in (payload.get("sessions") or [])
@@ -4197,6 +4472,14 @@ def prepare_workload_corpus(
             if swe_manifest is None or session_id not in swe_manifest:
                 raise SweManifestError(f"SWE trace has no real repository mapping: {session_id}")
             session["swe_task"] = swe_manifest[session_id].public_dict()
+        # Reproduce the command locale when the recorded trajectory explicitly
+        # reports it. Django's PostgreSQL shell test depends on this setting.
+        locale_override = "C" if any(
+            "Locale encoding: ANSI_X3.4-1968" in str(tool.get("recorded_result") or "")
+            or "UnicodeEncodeError: 'ascii' codec" in str(tool.get("recorded_result") or "")
+            for turn in session.get("turns") or []
+            for tool in turn.get("tool_calls") or []
+        ) else ""
         spec = backends.get(workload)
         if spec is None:
             continue
@@ -4216,6 +4499,11 @@ def prepare_workload_corpus(
                     mapped[workload] += 1
                 elif workload == "software_engineering_qa":
                     arguments = dict(tool.get("arguments") or {})
+                    recorded_command = str(arguments.get("command") or arguments.get("cmd") or "")
+                    if name in {"mcp__environment__bash", "bash"} and recorded_command:
+                        # OpenClaw sees the recorded shell command. The SSH
+                        # adapter selects the prepared execution script later.
+                        tool["swe_original_command"] = recorded_command
                     full_command = _swe_sandbox_command(
                         session_id,
                         workload,
@@ -4228,6 +4516,12 @@ def prepare_workload_corpus(
                         swe_manifest[session_id],
                         tool_cpu_ids,
                         tool_cgroup_quota,
+                        swe_task_image_runtime,
+                        swe_run_key,
+                        locale_override,
+                        tuple(dict.fromkeys(re.findall(
+                            r"/tmp/tmp[A-Za-z0-9_-]+", str(tool.get("recorded_result") or "")
+                        ))),
                     )
                     script_name = f"{int(turn.get('index', 0)):04d}-{call_index:03d}.py"
                     script_dir = out.parent / "swe-tool-scripts" / hashlib.sha256(session_id.encode()).hexdigest()[:16]
@@ -4274,7 +4568,11 @@ def prepare_workload_corpus(
     payload["tool_backend"] = "workload-specific"
     payload["backend_mapping_counts"] = mapped
     payload["backend_fidelity"] = {
-        "software_engineering_qa": "real OpenShell commands against pinned source checkout; task-image dependencies are not guaranteed",
+        "software_engineering_qa": (
+            "real OpenShell commands against pinned source checkout in the task image"
+            if swe_task_image_runtime else
+            "real OpenShell commands against pinned source checkout; task-image dependencies are not guaranteed"
+        ),
         "personal_assistant": "stateful AppWorld API execution",
         "research_deep_search": "local generated responses with recorded byte lengths where available; no live document service",
         "customer_support_ops": "local generated responses with recorded byte lengths where available; no live support service",
@@ -4362,7 +4660,7 @@ def build_queue(
         # The benchmark is explicitly a multi-turn/tool-calling benchmark.
         # Exclude recorded conversational sessions with no tool calls before
         # applying the offset/limit; otherwise a workload can silently yield
-        # a one-turn no-op and invalidate the profiler plots.
+        # a one-turn no-op and invalidate the profiler tables.
         tool_rich_sessions = [
             session for session in payload["sessions"]
             if any(turn.get("tool_calls") for turn in session.get("turns") or [])
@@ -5289,7 +5587,11 @@ def collect_trace(
     analyze_per_turn(traces, shell / "prometheus", trace_dir / "analysis")
     backend_dir = trace_dir / ("data/appworld" if backend.benchmark == "appworld" else "data/backend")
     backend_dir.mkdir(parents=True, exist_ok=True)
-    session_events = _collect_backend_events(cluster, backend, session_id, start, current_trace_ids)
+    session_events = _collect_backend_events(
+        cluster, backend, session_id, start, current_trace_ids,
+        run_key=hashlib.sha256(str(trace_dir.parents[1].resolve()).encode("utf-8")).hexdigest()[:32],
+        end=end,
+    )
     (backend_dir / "events.jsonl").write_text(
         "\n".join(json.dumps(event, separators=(",", ":")) for event in session_events)
         + ("\n" if session_events else ""),
@@ -5302,12 +5604,7 @@ def collect_trace(
     expected_session = input_sessions[0]
     expected_turns = len(expected_session.get("turns") or [])
     expected_tool_calls = sum(len(turn.get("tool_calls") or []) for turn in expected_session.get("turns") or [])
-    plot_appworld_events(
-        backend_dir / "events.jsonl",
-        backend_dir / ("appworld_api_latency.png" if backend.benchmark == "appworld" else "backend_api_latency.png"),
-        f"Shell {backend.name} API latency: {session_id}",
-        empty_reason="conversational trace performed no backend tool calls (not applicable)" if expected_tool_calls == 0 else None,
-    )
+    write_backend_calls(session_events, backend_dir / "backend_calls.csv")
     per_turn = json.loads((shell / "profile-v2/per_turn.json").read_text(encoding="utf-8"))
     per_tool = json.loads((shell / "profile-v2/per_tool.json").read_text(encoding="utf-8"))
     try:
@@ -5316,7 +5613,6 @@ def collect_trace(
             expected_turns=expected_turns,
             expected_tool_calls=expected_tool_calls,
             backend_dir_name="appworld" if backend.benchmark == "appworld" else "backend",
-            backend_plot_name="appworld_api_latency.png" if backend.benchmark == "appworld" else "backend_api_latency.png",
         )
     except OutputValidationError as exc:
         (trace_dir / "output_validation_error.json").write_text(str(exc) + "\n", encoding="utf-8")
@@ -5418,6 +5714,11 @@ def main() -> int:
         type=Path,
         default=ROOT / "config/swebench-trace-manifest.json",
         help="pinned SWE task metadata mapping traces to repository commits and task images",
+    )
+    parser.add_argument(
+        "--swe-sandbox-task-image",
+        action="store_true",
+        help="create each SWE OpenShell sandbox from its task image instead of the generic workload image",
     )
     parser.add_argument("--namespace", default="trace-replay")
     parser.add_argument("--system-namespace", default="trace-replay")
@@ -5815,6 +6116,7 @@ def main() -> int:
             selected_session_ids=selected_ids,
             tool_cpu_ids=tool_cpu_ids,
             tool_cgroup_quota=tool_cgroup_quota,
+            swe_task_image_runtime=args.swe_sandbox_task_image,
         )
         queue = build_queue(
             corpus,
@@ -5842,14 +6144,14 @@ def main() -> int:
                 f"SWE agent slot {slot + 1} must be in the warm pool because repository staging "
                 "creates its sandbox before measurement; increase --warm-pool-size or change the cohort"
             )
-    # Keep the OpenShell sandbox image generic and supported.  SWE-bench task
-    # images are used by the staging Jobs below to copy the real repository
-    # snapshot into the agent workspace; they are not used as OpenShell images
-    # because many task images do not contain OpenShell's trusted `ip` helper.
+    # Task images are always used for repository staging. The opt-in mode
+    # also uses each task image as its OpenShell workload image so commands
+    # execute with that task's Python environment and installed dependencies.
     swe_task_images_by_agent: list[str | None] = [None] * args.agents
     swe_tasks_by_agent: dict[int, dict[str, Any]] = {}
     swe_items_by_agent: dict[int, dict[str, Any]] = {}
     swe_script_dirs_by_agent: dict[int, Path] = {}
+    swe_command_maps_by_agent: list[dict[str, list[str]] | None] = [None] * args.agents
     swe_assignments: dict[int, str] = {}
     for position, item in enumerate(queue):
         binding_index = (selected_agent_indices[position] - 1) if selected_agent_indices else ((position + args.agent_offset) % args.agents)
@@ -5870,9 +6172,13 @@ def main() -> int:
         swe_task_images_by_agent[binding_index] = image
         swe_tasks_by_agent[binding_index] = dict(task)
         swe_items_by_agent[binding_index] = item
+        swe_command_maps_by_agent[binding_index] = _swe_command_map(item["session"])
         swe_script_dirs_by_agent[binding_index] = (
             args.out / "swe-tool-scripts" / hashlib.sha256(session_id.encode()).hexdigest()[:16]
         )
+    active_swe_sandbox_images = swe_task_images_by_agent if args.swe_sandbox_task_image else None
+    if args.allow_cross_node and any(swe_command_maps_by_agent):
+        parser.error("recorded SWE bash commands require the node-pinned OpenShell SSH adapter")
     args.out.mkdir(parents=True, exist_ok=True)
     runtime_corpus = args.out / "runtime-replay-corpus.json"
     runtime_corpus.parent.mkdir(parents=True, exist_ok=True)
@@ -6243,6 +6549,8 @@ def main() -> int:
             simulated_ttft_ms=args.simulated_ttft,
             simulated_itl_ms=args.simulated_itl,
             sandbox_cpu_limit=sandbox_cpu_limit,
+            sandbox_images=active_swe_sandbox_images,
+            swe_command_maps=swe_command_maps_by_agent,
         )
     else:
         preferred_node = args.resume_preferred_node
@@ -6265,6 +6573,8 @@ def main() -> int:
                 simulated_ttft_ms=args.simulated_ttft,
                 simulated_itl_ms=args.simulated_itl,
                 sandbox_cpu_limit=sandbox_cpu_limit,
+                sandbox_images=[active_swe_sandbox_images[index - 1] for index in resume_pending_indices] if active_swe_sandbox_images is not None else None,
+                swe_command_maps=[swe_command_maps_by_agent[index - 1] for index in resume_pending_indices],
             )
         if resume_missing_indices:
             deploy_agents(
@@ -6285,6 +6595,8 @@ def main() -> int:
                 simulated_ttft_ms=args.simulated_ttft,
                 simulated_itl_ms=args.simulated_itl,
                 sandbox_cpu_limit=sandbox_cpu_limit,
+                sandbox_images=[active_swe_sandbox_images[index - 1] for index in resume_missing_indices] if active_swe_sandbox_images is not None else None,
+                swe_command_maps=[swe_command_maps_by_agent[index - 1] for index in resume_missing_indices],
             )
         agent_bindings = _retry_cluster_read_stage(
             "agent binding inventory",
@@ -6336,6 +6648,8 @@ def main() -> int:
                 simulated_ttft_ms=args.simulated_ttft,
                 simulated_itl_ms=args.simulated_itl,
                 sandbox_cpu_limit=sandbox_cpu_limit,
+                sandbox_images=[active_swe_sandbox_images[index - 1] for index in reconcile_agent_indices] if active_swe_sandbox_images is not None else None,
+                swe_command_maps=[swe_command_maps_by_agent[index - 1] for index in reconcile_agent_indices],
             )
             agent_bindings = _retry_cluster_read_stage(
                 "post-reconcile agent binding inventory",
@@ -6387,6 +6701,7 @@ def main() -> int:
         staging_node=auxiliary_job_node,
         checkpoint_dir=args.out,
         scripts_by_agent=swe_script_dirs_by_agent,
+        task_image_runtime=args.swe_sandbox_task_image,
     )
     # Repository staging already verified every commit directly on the exact
     # PVC subpath mounted by its OpenShell workspace.  The synthetic prewarm
@@ -6539,6 +6854,7 @@ def main() -> int:
                             staging_node=auxiliary_job_node,
                             checkpoint_dir=None,
                             scripts_by_agent={binding_index: swe_script_dirs_by_agent[binding_index]},
+                            task_image_runtime=args.swe_sandbox_task_image,
                         )
                     # Kubernetes Jobs are immutable; include a per-process
                     # suffix so reruns never reuse a completed Job name.

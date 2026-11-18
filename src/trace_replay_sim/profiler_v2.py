@@ -15,6 +15,8 @@ import statistics
 from pathlib import Path
 from typing import Any
 
+from .measurement_tables import write_profile_tables
+
 
 def _tags(span: dict[str, Any]) -> dict[str, Any]:
     return {str(item.get("key")): item.get("value") for item in span.get("tags", [])}
@@ -232,9 +234,54 @@ def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, str], dict[str, An
         following_failures = [item for item in failed_tools if end is not None and (_start_ms(item) or 0) >= end
                               and (next_start is None or (_start_ms(item) or 0) < next_start)]
         tool_failure_ms = sum(_span_ms(item) or 0 for item in following_failures) if following_failures else None
-        previous_hops = [span for span in tools + execs if _end_ms(span) is not None and start is not None and _end_ms(span) <= start]
-        previous_end = max((_end_ms(span) or 0.0) for span in previous_hops) if previous_hops else _start_ms(harness)
+        # Use the tool result for *this* transition. Reusing a tool from an
+        # earlier turn would accidentally charge an intervening model response
+        # to context assembly when the current turn has no tool result.
+        previous_model_end = _end_ms(models[turn - 1]) if turn else None
+        previous_tools = [
+            span for span in tools
+            if previous_model_end is not None and start is not None
+            and _start_ms(span) is not None and _end_ms(span) is not None
+            and previous_model_end <= _start_ms(span) <= _end_ms(span) <= start
+        ]
+        previous_tool = max(previous_tools, key=lambda span: _end_ms(span) or 0) if previous_tools else None
+        if previous_tool is not None:
+            previous_end = _end_ms(previous_tool)
+            context_start_source = "prior_tool_result"
+        elif turn == 0:
+            previous_end = _start_ms(harness)
+            context_start_source = "harness_run_start"
+        else:
+            previous_end = None
+            context_start_source = "missing_prior_tool_result"
         context_assembly_window_ms = max(0.0, start - previous_end) if start is not None and previous_end is not None else None
+        # Unlike model.call.start, this edge is recorded after the simulator
+        # has read the complete request body. It includes request transfer.
+        edge = edges.get((trace_id, str(model.get("spanID") or "")), {})
+        endpoint_recv_wall_ns = edge.get("t_recv_wall_ns")
+        body_read_wall_ns = edge.get("t_body_read_wall_ns")
+        endpoint_recv_ms = int(endpoint_recv_wall_ns) / 1e6 if endpoint_recv_wall_ns is not None else None
+        body_read_ms = int(body_read_wall_ns) / 1e6 if body_read_wall_ns is not None else None
+        context_boundary_status = "missing_endpoint_edge"
+        if previous_end is None:
+            context_boundary_status = "missing_start_boundary"
+        elif start is not None and endpoint_recv_ms is not None and body_read_ms is not None:
+            context_boundary_status = (
+                "ordered" if previous_end <= start <= endpoint_recv_ms <= body_read_ms
+                and (end is None or body_read_ms <= end)
+                else "inconsistent_order"
+            )
+        elif start is not None and body_read_ms is not None:
+            context_boundary_status = (
+                "ordered_missing_recv" if previous_end <= start <= body_read_ms
+                and (end is None or body_read_ms <= end)
+                else "inconsistent_order"
+            )
+        context_assembly_received_ms = None
+        if context_boundary_status in ("ordered", "ordered_missing_recv"):
+            elapsed = body_read_ms - previous_end
+            if elapsed < 60_000:
+                context_assembly_received_ms = round(elapsed, 3)
         # `openclaw.exec` is emitted after the LLM has requested a tool.  It
         # is therefore actual sandbox command execution, not pre-LLM sandbox
         # access/initialization.  Keep the cold command attribution separate
@@ -242,7 +289,6 @@ def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, str], dict[str, An
         sandbox_cold_exec_ms = None
         if following_execs and following_execs[0].get("spanID") == (execs[0].get("spanID") if execs else None):
             sandbox_cold_exec_ms = _span_ms(following_execs[0])
-        edge = edges.get((trace_id, str(model.get("spanID") or "")), {})
         next_edge = (
             edges.get((trace_id, str(models[turn + 1].get("spanID") or "")), {})
             if turn + 1 < len(models) else {}
@@ -258,14 +304,37 @@ def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, str], dict[str, An
                 full_gap_ms - (decode_ms or 0.0) - (exec_ms or 0.0) - (tool_failure_ms or 0.0),
             )
         model_ms = _span_ms(model)
+        # Context assembly ends after the model call has begun (the endpoint
+        # must read the request body). Use the union of those two intervals,
+        # not their sum, so request transfer is counted only once.
+        context_to_model_end_ms = (
+            round(end - previous_end, 3)
+            if context_boundary_status in ("ordered", "ordered_missing_recv")
+            and previous_end is not None and end is not None and end >= previous_end
+            else None
+        )
         ttft_ms = _number(_first(tags, "openclaw.model_call.time_to_first_byte_ms"))
         response_processing = None
+        response_processing_to_tool_start_ms = None
+        pre_execution_gap_ms = None
         response_boundary = "unavailable"
         if end is not None:
-            boundary = _start_ms(first_tool) if first_tool else next_start
+            tool_start = _start_ms(first_tool)
+            exec_start = _start_ms(following_execs[0]) if following_execs else None
+            if tool_start is not None and exec_start is not None and exec_start >= tool_start:
+                pre_execution_gap_ms = round(exec_start - tool_start, 3)
+            if tool_start is not None:
+                response_processing_to_tool_start_ms = max(0.0, tool_start - end)
+            # Response processing includes the pre-execution tool handoff.
+            # The wrapper span is diagnostic: it also contains OpenShell
+            # execution and must not be added to this response interval.
+            boundary = exec_start if exec_start is not None else tool_start if first_tool else next_start
             if boundary is not None:
                 response_processing = max(0.0, boundary - end)
-                response_boundary = "model_end_to_tool_start" if first_tool else "model_end_to_next_model"
+                response_boundary = (
+                    "model_end_to_openshell_exec_start" if exec_start is not None
+                    else "model_end_to_tool_start" if first_tool else "model_end_to_next_model"
+                )
         rows.append({
             "trace_id": trace_id,
             "model_span_id": str(model.get("spanID") or ""),
@@ -276,12 +345,15 @@ def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, str], dict[str, An
             "api": tags.get("openclaw.api"),
             "transport": tags.get("openclaw.transport"),
             "model_call_ms": model_ms,
+            "context_to_model_end_ms": context_to_model_end_ms,
             "ttft_ms": ttft_ms,
             "decode_proxy_ms": max(0.0, model_ms - ttft_ms) if model_ms is not None and ttft_ms is not None else None,
-            "context_assembly_ms": context_span_ms if context_span_ms and context_span_ms > 0 else None,
+            "context_assembly_ms": context_assembly_received_ms,
+            "context_span_direct_ms": context_span_ms if context_span_ms and context_span_ms > 0 else None,
             "context_span_present": context is not None,
             "context_span_duration_ms": context_span_ms,
-            "context_measurement_status": (
+            "context_measurement_status": context_boundary_status,
+            "context_span_status": (
                 "measured" if context_span_valid and context_span_ms and context_span_ms > 0
                 else "invalid_clock_skew_or_run_scope" if context is not None
                 else "missing"
@@ -301,6 +373,8 @@ def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, str], dict[str, An
             "cache_read_tokens": _number(_first(tags, "gen_ai.usage.cache_read_input_tokens", "gen_ai.usage.cache_read")),
             "cache_write_tokens": _number(_first(tags, "gen_ai.usage.cache_creation_input_tokens", "gen_ai.usage.cache_write")),
             "response_processing_ms": response_processing,
+            "response_processing_to_tool_start_ms": response_processing_to_tool_start_ms,
+            "pre_execution_gap_ms": pre_execution_gap_ms,
             "response_processing_full_ms": response_processing_full_ms,
             "context_assembly_residual_ms": (
                 max(0.0, response_processing_full_ms - response_processing)
@@ -316,6 +390,12 @@ def _trace_rows(trace: dict[str, Any], edges: dict[tuple[str, str], dict[str, An
             "tool_failure_ms": tool_failure_ms,
             "tool_failure_count": len(following_failures),
             "context_assembly_window_ms": context_assembly_window_ms,
+            "context_assembly_received_ms": context_assembly_received_ms,
+            "context_start_ms": previous_end,
+            "context_start_source": context_start_source,
+            "model_endpoint_recv_ms": endpoint_recv_ms,
+            "model_endpoint_body_read_ms": body_read_ms,
+            "context_boundary_status": context_boundary_status,
             "request_start_ms": run_start,
             "model_start_ms": start,
             "model_end_ms": end,
@@ -396,7 +476,7 @@ def build_rows(raw_traces: list[dict[str, Any]], edges: list[dict[str, Any]], dr
         )
         for index, row in enumerate(ordered_rows):
             if index == 0:
-                row["context_assembly_bucket_ms"] = row.get("prompt_boundary_ms")
+                row["context_assembly_bucket_ms"] = row.get("context_assembly_received_ms")
                 row["response_processing_bucket_ms"] = 0.0
                 # The first model call has not produced a response yet.  Its
                 # tool/exec spans belong to the transition into the next
@@ -406,7 +486,7 @@ def build_rows(raw_traces: list[dict[str, Any]], edges: list[dict[str, Any]], dr
                 row["tool_failure_bucket_ms"] = 0.0
             else:
                 previous = ordered_rows[index - 1]
-                row["context_assembly_bucket_ms"] = row.get("context_assembly_window_ms")
+                row["context_assembly_bucket_ms"] = row.get("context_assembly_received_ms")
                 # Keep the primary waterfall on the measured response span.
                 # The full model-to-continuation gap includes dispatch/wait
                 # time and is retained in the detailed efficiency fields.
@@ -495,7 +575,7 @@ def _collapse_logical_rows(
     for turn, (_, _, row) in enumerate(ordered):
         edge = row.pop("_logical_edge", None)
         if turn == 0:
-            row["context_assembly_bucket_ms"] = row.get("prompt_boundary_ms")
+            row["context_assembly_bucket_ms"] = row.get("context_assembly_received_ms")
             row["response_processing_bucket_ms"] = 0.0
             row["tool_dispatch_overhead_bucket_ms"] = 0.0
             row["sandbox_execution_bucket_ms"] = 0.0
@@ -514,22 +594,7 @@ def _collapse_logical_rows(
             row["tool_dispatch_overhead_bucket_ms"] = 0.0
             row["sandbox_execution_bucket_ms"] = previous.get("exec_ms") or 0.0 if previous else 0.0
             row["tool_failure_bucket_ms"] = previous.get("tool_failure_ms") or 0.0 if previous else 0.0
-            measured_context = row.get("context_assembly_window_ms")
-            if previous and previous.get("trace_id") == row.get("trace_id") and measured_context is not None:
-                row["context_assembly_bucket_ms"] = measured_context
-            elif row.get("prompt_boundary_ms") is not None:
-                # Across client requests the broad boundary includes the
-                # preceding response and tool. Assign only the residual to
-                # preparation; never add the full boundary to those stages.
-                row["context_assembly_bucket_ms"] = round(max(
-                    0.0,
-                    float(row["prompt_boundary_ms"])
-                    - float(row["response_processing_bucket_ms"])
-                    - float(row["sandbox_execution_bucket_ms"])
-                    - float(row["tool_failure_bucket_ms"]),
-                ), 3)
-            else:
-                row["context_assembly_bucket_ms"] = measured_context
+            row["context_assembly_bucket_ms"] = row.get("context_assembly_received_ms")
         row["turn"] = turn
         row["sandbox_init_bucket_ms"] = row.get("sandbox_init_ms")
         logical.append(row)
@@ -573,592 +638,19 @@ def _timing_segments_for_logical_rows(
     return collapsed
 
 
-def _prom_series(path: Path) -> list[tuple[float, float]]:
-    if not path.exists():
-        return []
-    try:
-        payload = _load_json(path)
-        result = (payload.get("data") or {}).get("result") or []
-        by_timestamp: dict[float, float] = {}
-        for series in result:
-            for ts, value in series.get("values", []):
-                if value in ("NaN", "Inf", "+Inf", "-Inf"):
-                    continue
-                timestamp = float(ts)
-                by_timestamp[timestamp] = by_timestamp.get(timestamp, 0.0) + float(value)
-        return sorted(by_timestamp.items())
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return []
-
-
-def _counter_rate(series: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    rates: list[tuple[float, float]] = []
-    for (previous_ts, previous_value), (timestamp, value) in zip(series, series[1:]):
-        delta_s = timestamp - previous_ts
-        if delta_s <= 0:
-            continue
-        # Counter resets/restarts are represented as a missing rate, not a spike.
-        if value < previous_value:
-            continue
-        rates.append((timestamp, (value - previous_value) / delta_s))
-    return rates
-
-
-def _prom_counter_rate(path: Path) -> list[tuple[float, float]]:
-    if not path.exists():
-        return []
-
-
-def _cgroup_series(path: Path) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-    if not path.exists():
-        return [], []
-    try:
-        samples = []
-        with path.open(encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                try:
-                    timestamp = float(row["epoch_ns"]) / 1e9
-                    cpu = float(row["cpu_usage_usec"])
-                    memory = float(row["memory_bytes"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if timestamp > 0 and cpu >= 0 and memory >= 0:
-                    samples.append((timestamp, cpu, memory))
-    except OSError:
-        return [], []
-    samples.sort(key=lambda sample: sample[0])
-    cpu = []
-    for previous, current in zip(samples, samples[1:]):
-        delta_s = current[0] - previous[0]
-        delta_cpu = current[1] - previous[1]
-        if delta_s > 0 and delta_cpu >= 0:
-            cpu.append((current[0], delta_cpu / (delta_s * 1_000_000)))
-    memory = [(timestamp, value) for timestamp, _, value in samples]
-    return cpu, memory
-    try:
-        payload = _load_json(path)
-        result = (payload.get("data") or {}).get("result") or []
-        by_timestamp: dict[float, float] = {}
-        for series in result:
-            points = sorted((float(ts), float(value)) for ts, value in series.get("values", []))
-            for timestamp, rate in _counter_rate(points):
-                by_timestamp[timestamp] = by_timestamp.get(timestamp, 0.0) + rate
-        return sorted(by_timestamp.items())
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return []
-
-
-def _plots(rows: list[dict[str, Any]], prom_dir: Path | None, out: Path) -> list[str]:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return []
-    out.mkdir(parents=True, exist_ok=True)
-    labels = [f"T{row['turn']}" for row in rows]
-    x = list(range(len(rows)))
-    files: list[str] = []
-
-    import numpy as np
-    from matplotlib.font_manager import FontProperties
-
-    # Render the full request-to-tool cycle in event order. Phase rows are
-    # turn-boundary rows: turn 0 is the initial user request and therefore
-    # contains only pre-LLM preparation. Response processing and sandbox
-    # execution from the previous model response are attached to the next
-    # turn by build_rows(). This prevents a post-LLM command from appearing
-    # in Step 0 as if it happened before the first model call.
-    chart_rows = []
-    for row in sorted(rows, key=lambda item: item.get("turn", 0)):
-        context = row.get("context_assembly_bucket_ms") or 0.0
-        stages = {
-            "Sandbox prewarm / readiness": row.get("sandbox_init_bucket_ms") or 0.0,
-            "Context assembly / pre-LLM preparation": context,
-            "LLM call": row.get("model_call_ms") or 0.0,
-            "Response processing": row.get("response_processing_bucket_ms") or 0.0,
-            "Tool dispatch gap (unattributed)": row.get("tool_dispatch_overhead_bucket_ms") or 0.0,
-            "OpenShell command execution": row.get("sandbox_execution_bucket_ms") or 0.0,
-            "Tool failure / rejected execution": row.get("tool_failure_bucket_ms") or 0.0,
-        }
-        stages["Total_Latency"] = sum(stages.values())
-        stages["step"] = f"Step {row.get('turn', 0)}"
-        chart_rows.append(stages)
-
-    chart_rows.reverse()
-    colors = {
-        "Sandbox prewarm / readiness": "#A16207",
-        "Context assembly / pre-LLM preparation": "#0284C7",
-        "LLM call": "#475569",
-        "Response processing": "#059669",
-        "Tool dispatch gap (unattributed)": "#D97706",
-        "OpenShell command execution": "#7C3AED",
-        "Tool failure / rejected execution": "#DC2626",
-    }
-    stages = list(colors)
-    regular = FontProperties(family="DejaVu Sans", weight="normal")
-
-    overhead_stages = [
-        "Context assembly / pre-LLM preparation",
-        "Sandbox prewarm / readiness",
-        "OpenShell command execution",
-        "Response processing",
-        "Tool dispatch gap (unattributed)",
-        "Tool failure / rejected execution",
-    ]
-    overhead_rows = []
-    for item in chart_rows:
-        overhead = {stage: item[stage] for stage in overhead_stages}
-        overhead["Total_Latency"] = sum(overhead.values())
-        overhead["step"] = item["step"]
-        overhead_rows.append(overhead)
-
-    def render_chart(
-        path: Path,
-        plot_rows: list[dict[str, Any]],
-        plot_stages: list[str],
-        x_limit: float,
-        subtitle: str,
-        show_off_scale: bool,
-        annotate_threshold: float,
-    ) -> None:
-        plot_y = np.arange(len(plot_rows))
-        height = 0.62
-        axis_left = np.zeros(len(plot_rows))
-        fig, axis = plt.subplots(figsize=(13, 9), dpi=300)
-        for stage in plot_stages:
-            values = np.array([item[stage] for item in plot_rows], dtype=float)
-            axis.barh(
-                plot_y,
-                values,
-                left=axis_left,
-                height=height,
-                label=stage,
-                color=colors[stage],
-                edgecolor="white",
-                linewidth=1,
-            )
-            for index, (value, left_position) in enumerate(zip(values, axis_left)):
-                if value >= annotate_threshold and left_position + value / 2 <= x_limit:
-                    axis.text(
-                        left_position + value / 2,
-                        plot_y[index],
-                        f"{value:.0f}",
-                        va="center",
-                        ha="center",
-                        color="white",
-                        fontsize=8.5,
-                        fontproperties=regular,
-                    )
-            axis_left += values
-
-        for index, item in enumerate(plot_rows):
-            total = item["Total_Latency"]
-            if total <= x_limit:
-                axis.text(total + 10, plot_y[index], f"{total:.0f} ms", va="center", ha="left", fontsize=9.5, fontproperties=regular, color="#1E293B")
-            elif show_off_scale:
-                axis.annotate(
-                    f"{total:.0f} ms (off-scale)",
-                    xy=(x_limit, plot_y[index]),
-                    xytext=(-8, 0),
-                    textcoords="offset points",
-                    va="center",
-                    ha="right",
-                    fontsize=8.5,
-                    color="#B45309",
-                    fontproperties=regular,
-                    arrowprops={"arrowstyle": "-", "color": "#B45309"},
-                )
-
-        axis.set_xlim(0, x_limit)
-        axis.grid(axis="x", linestyle=":", alpha=0.6, color="#94A3B8")
-        axis.set_axisbelow(True)
-        axis.set_yticks(plot_y)
-        axis.set_yticklabels([item["step"] for item in plot_rows], fontsize=10.5, color="#1E293B", fontproperties=regular)
-        for tick in axis.get_yticklabels():
-            tick.set_fontproperties(regular)
-        axis.set_xlabel("Per Step Latency [ms]", fontsize=11, labelpad=10, color="#0F172A", fontproperties=regular)
-        axis.set_ylabel("Step", fontsize=11, labelpad=10, color="#0F172A", fontproperties=regular)
-        axis.set_title(subtitle, fontsize=10.5, color="#475569", pad=18, loc="left")
-        # Do not show a phase in the legend when it has no measured samples.
-        # In particular, a red failure category must not imply a failure when
-        # the run contains no rejected or failed tool execution.
-        visible_stages = [
-            stage for stage in plot_stages
-            if any(float(item.get(stage) or 0.0) > 0.0 for item in plot_rows)
-        ]
-        handles, labels = axis.get_legend_handles_labels()
-        visible = [(handle, label) for handle, label in zip(handles, labels) if label in visible_stages]
-        if visible:
-            axis.legend(
-                [handle for handle, _ in visible],
-                [label for _, label in visible],
-                loc="upper left",
-                bbox_to_anchor=(1.01, 1.0),
-                ncol=1,
-                frameon=True,
-                facecolor="#F8FAFC",
-                edgecolor="#E2E8F0",
-                fontsize=9.5,
-            )
-        fig.suptitle(
-            "OpenClaw & OpenShell Multi-Step Profiling Analysis",
-            fontsize=15,
-            fontproperties=FontProperties(family="DejaVu Sans", weight="normal", size=15),
-            color="#0F172A",
-            y=0.98,
-        )
-        fig.tight_layout()
-        fig.subplots_adjust(left=0.13, right=0.78, top=0.88, bottom=0.10)
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-
-    overhead_totals = sorted(item["Total_Latency"] for item in overhead_rows)
-    overhead_p95 = overhead_totals[min(len(overhead_totals) - 1, max(0, int(len(overhead_totals) * 0.95) - 1))] if overhead_totals else 0.0
-    overhead_limit = max(880.0, overhead_p95 + 250.0)
-    primary_path = out / "latency_waterfall.png"
-    render_chart(
-        primary_path,
-        overhead_rows,
-        overhead_stages,
-        overhead_limit,
-        f"Per-step OpenClaw/OpenShell overhead (model latency excluded; dispatch gap is unattributed; limit {overhead_limit:.0f} ms)",
-        True,
-        45.0,
-    )
-    files.append(primary_path.name)
-    max_total = max((item["Total_Latency"] for item in chart_rows), default=0.0)
-    full_path = out / "latency_waterfall_full_range.png"
-    render_chart(
-        full_path,
-        chart_rows,
-        stages,
-        max(1.0, max_total * 1.04),
-        "Full request → context → LLM → OpenShell cycle including long dispatch intervals",
-        False,
-        max(100.0, max_total * 0.01),
-    )
-    files.append(full_path.name)
-
-    # Keep an explicit machine-readable note next to the figure. The prewarm
-    # request is a direct end-to-end readiness measurement and remains
-    # separate from the first measured post-LLM tool execution.
-    (out / "latency_waterfall_metadata.json").write_text(
-        json.dumps({
-            "sequence": [
-                "request_arrival",
-                "context_assembly_pre_llm",
-                "sandbox_prewarm_and_readiness",
-                "llm_call",
-                "response_processing",
-                "openshell_dispatch_wait",
-                "openshell_tool_execution",
-            ],
-            "sandbox_access_pre_llm": {
-                "status": "measured_by_prewarm_request",
-                "reason": "A harmless OpenShell exec completes before the measured replay turns; its driver boundary is recorded in sandbox_lifecycle.json.",
-            },
-            "warm_pool_readiness": {
-                "status": "measured_end_to_end",
-                "reason": "The prewarm request measures the complete readiness path; pod create-to-ready is retained separately to classify cold creation versus warm reuse.",
-            },
-            "context_source": "request/harness start to first model.call start; native context span is rejected when clock-skewed or run-scoped.",
-        }, indent=2),
-        encoding="utf-8",
-    )
-    files.append("latency_waterfall_metadata.json")
-
-    for key, title, filename, color in (
-        ("model_call_ms", "Model latency [ms]", "model_latency_ms.png", "#2563eb"),
-        ("exec_ms", "OpenShell execution latency [ms]", "openshell_execution_latency_ms.png", "#7c3aed"),
-    ):
-        values = [row.get(key) for row in rows]
-        if any(value is not None for value in values):
-            fig, ax = plt.subplots(figsize=(10, 4.5))
-            ax.plot(x, [value if value is not None else math.nan for value in values], marker="o", color=color)
-            ax.set_title(title)
-            ax.set_xlabel("Turn")
-            ax.set_ylabel("Milliseconds")
-            ax.grid(alpha=0.25)
-            fig.tight_layout()
-            path = out / filename
-            fig.savefig(path, dpi=160)
-            plt.close(fig)
-            files.append(path.name)
-
-    # Warm-pool handoff is a separate boundary: it overlaps command execution
-    # and therefore must not be stacked into the per-turn waterfall.
-    request_to_action = rows[0].get("sandbox_request_to_first_action_ms") if rows else None
-    if request_to_action is not None:
-        fig, ax = plt.subplots(figsize=(8.5, 4.5))
-        value = float(request_to_action)
-        ax.barh(["Ready sandbox → first real action"], [value], color="#16A34A")
-        ax.set_xlabel("Milliseconds")
-        ax.set_title("Ready Sandbox Request to First Agent Action")
-        ax.text(value, 0, f" {value:.1f} ms", va="center", ha="left", fontweight="bold")
-        ax.grid(axis="x", alpha=0.25)
-        fig.tight_layout()
-        path = out / "sandbox_request_to_first_action_ms.png"
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-        files.append(path.name)
-    elif rows and "not_applicable" in str(rows[0].get("sandbox_request_to_first_action_status") or ""):
-        # Conversational traces (zero recorded tool calls) never execute an
-        # OpenShell action. Emit the sandbox-cost plot as an explicit
-        # not-applicable artifact so the unchanged output validator still
-        # finds a valid plot and the not_applicable marking is visible in
-        # the deliverable itself.
-        fig, ax = plt.subplots(figsize=(8.5, 4.5))
-        ax.barh(["Ready sandbox → first real action"], [0], color="#94A3B8")
-        ax.set_xlim(0, 1)
-        ax.set_xlabel("Milliseconds")
-        ax.set_title("Ready Sandbox Request to First Agent Action")
-        ax.text(
-            0.5,
-            0,
-            "not applicable: conversational trace performed no OpenShell tool execution",
-            va="center",
-            ha="center",
-            fontsize=10,
-            color="#475569",
-            fontweight="bold",
-        )
-        ax.grid(axis="x", alpha=0.25)
-        fig.tight_layout()
-        path = out / "sandbox_request_to_first_action_ms.png"
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-        files.append(path.name)
-
-    # This is an observable boundary, not an additive waterfall bucket.
-    boundary_values = [row.get("prompt_boundary_ms") for row in rows]
-    if any(value is not None for value in boundary_values):
-        fig, ax = plt.subplots(figsize=(15, max(5, len(rows) * 0.24)))
-        ax.barh(x, [value or 0.0 for value in boundary_values], color="#2563eb")
-        ax.set_yticks(x, labels)
-        ax.set_xlabel("Milliseconds")
-        ax.set_title("OpenClaw And OpenShell Multi-Turn Profiling Analysis - Prompt Boundary [ms]")
-        ax.text(
-            0.99,
-            0.02,
-            "Driver → first mock prompt; then previous mock turn end → next mock prompt",
-            transform=ax.transAxes,
-            ha="right",
-            va="bottom",
-            fontsize=9,
-        )
-        fig.tight_layout()
-        path = out / "prompt_boundary.png"
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-        files.append(path.name)
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    metrics = [
-        ("prompt_chars", "Assembled prompt characters", axes[0, 0]),
-        ("input_tokens", "Input tokens", axes[0, 1]),
-        ("response_processing_full_ms", "Response processing ms", axes[1, 0]),
-        ("exec_ms", "Sandbox execution ms", axes[1, 1]),
-    ]
-    for key, title, axis in metrics:
-        values = [row.get(key) for row in rows]
-        axis.plot(x, [value if value is not None else math.nan for value in values], marker="o")
-        axis.set_title(title)
-        axis.set_xlabel("Turn")
-        axis.grid(alpha=0.25)
-    fig.suptitle("OpenClaw And OpenShell Multi-Turn Profiling Analysis - Turn Metrics [ms]")
-    fig.tight_layout()
-    path = out / "otel_turn_metrics.png"
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    files.append(path.name)
-
-    # Keep the per-turn OpenClaw/OpenShell comparison explicit.  The primary
-    # waterfall intentionally excludes model generation, while this report
-    # keeps model time visible and separates the observable harness boundary,
-    # dispatch overhead, and live sandbox execution.  These are measured
-    # components/derived boundaries, not a claim that every component is
-    # mutually exclusive at the implementation level.
-    efficiency_rows: list[dict[str, float | int]] = []
-    for row in rows:
-        sandbox_init = float(row.get("sandbox_init_bucket_ms") or 0.0)
-        prompt_boundary = float(row.get("prompt_boundary_ms") or 0.0)
-        context = float(row.get("context_assembly_bucket_ms") or 0.0)
-        response_processing = float(row.get("response_processing_full_ms") or 0.0)
-        dispatch_overhead = float(row.get("tool_dispatch_overhead_bucket_ms") or 0.0)
-        sandbox_exec = float(row.get("sandbox_execution_bucket_ms") or 0.0)
-        tool_failure = float(row.get("tool_failure_bucket_ms") or 0.0)
-        model_call = float(row.get("model_call_ms") or 0.0)
-        # Use the turn-boundary buckets written by build_rows(). In
-        # particular, response/tool values are zero for turn 0 and represent
-        # the previous model response on later rows.
-        phase_response = float(row.get("response_processing_bucket_ms") or 0.0)
-        openclaw_overhead = context + phase_response + dispatch_overhead
-        non_model_path = sandbox_init + openclaw_overhead + sandbox_exec + tool_failure
-        efficiency_rows.append({
-            "turn": int(row.get("turn") or 0),
-            "model_call_ms": model_call,
-            "sandbox_init_ms": sandbox_init,
-            "prompt_boundary_ms": context,
-            "raw_prompt_boundary_ms": prompt_boundary,
-            "response_processing_ms": phase_response,
-            "response_processing_raw_ms": response_processing,
-            "tool_dispatch_overhead_ms": dispatch_overhead,
-            "openclaw_observed_overhead_ms": openclaw_overhead,
-            "openshell_exec_ms": sandbox_exec,
-            "tool_failure_ms": tool_failure,
-            "non_model_path_ms": non_model_path,
-            "openshell_share_pct": (100.0 * sandbox_exec / non_model_path) if non_model_path else 0.0,
-        })
-    if efficiency_rows:
-        fields = list(efficiency_rows[0])
-        with (out / "per_turn_efficiency.csv").open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(efficiency_rows)
-        turns = [row["turn"] for row in efficiency_rows]
-        fig, axes = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
-        bottom = [0.0] * len(efficiency_rows)
-        components = (
-            ("sandbox_init_ms", "Sandbox initialization (direct span only)", "#A16207"),
-            ("prompt_boundary_ms", "Prompt/context boundary", "#2563EB"),
-            ("response_processing_ms", "Response processing", "#059669"),
-            ("tool_dispatch_overhead_ms", "OpenClaw/OpenShell dispatch overhead", "#D97706"),
-            ("openshell_exec_ms", "OpenShell sandbox execution", "#7C3AED"),
-            ("tool_failure_ms", "Tool failure / rejected execution", "#DC2626"),
-        )
-        for key, label, color in components:
-            values = [row[key] for row in efficiency_rows]
-            axes[0].bar(turns, values, bottom=bottom, label=label, color=color)
-            bottom = [left + value for left, value in zip(bottom, values)]
-        axes[0].plot(turns, [row["model_call_ms"] for row in efficiency_rows], "k.-", label="Model call (reference)")
-        axes[0].set_ylabel("Milliseconds")
-        axes[0].set_title("Per-turn OpenClaw and OpenShell observed path")
-        axes[0].grid(axis="y", alpha=0.25)
-        axes[0].legend(loc="upper right", ncol=2)
-        axes[1].plot(turns, [row["openclaw_observed_overhead_ms"] for row in efficiency_rows], "o-", label="OpenClaw observed overhead")
-        axes[1].plot(turns, [row["openshell_exec_ms"] for row in efficiency_rows], "o-", label="OpenShell execution")
-        axes[1].plot(turns, [row["openshell_share_pct"] for row in efficiency_rows], "o-", label="OpenShell share [%]")
-        axes[1].set_xlabel("Turn")
-        axes[1].set_ylabel("Milliseconds / percent")
-        axes[1].set_title("Per-turn harness versus sandbox efficiency signals")
-        axes[1].grid(alpha=0.25)
-        axes[1].legend(loc="upper right")
-        fig.tight_layout()
-        path = out / "openclaw_openshell_per_turn.png"
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-        files.append(path.name)
-
-    cgroup_cpu: dict[str, list[tuple[float, float]]] = {}
-    cgroup_memory: dict[str, list[tuple[float, float]]] = {}
-    if prom_dir:
-        for source in sorted((prom_dir / "cgroup").glob("*.csv")):
-            cpu, memory = _cgroup_series(source)
-            if cpu:
-                cgroup_cpu[source.stem] = cpu
-            if memory:
-                cgroup_memory[source.stem] = memory
-    if cgroup_cpu or cgroup_memory:
-        timestamps = [ts for series in [*cgroup_cpu.values(), *cgroup_memory.values()] for ts, _ in series]
-        origin = min(timestamps)
-        fig, axes = plt.subplots(2, 1, figsize=(15, 9), sharex=True)
-        for label, series in cgroup_cpu.items():
-            axes[0].plot([ts - origin for ts, _ in series], [value for _, value in series], label=label)
-        for label, series in cgroup_memory.items():
-            axes[1].plot([ts - origin for ts, _ in series], [value / (1024 * 1024) for _, value in series], label=label)
-        axes[0].set_title("OpenClaw And OpenShell Multi-Turn Profiling Analysis - CPU [cores]")
-        axes[0].set_ylabel("CPU cores")
-        axes[1].set_title("OpenClaw And OpenShell Multi-Turn Profiling Analysis - Memory [MiB]")
-        axes[1].set_ylabel("Memory MiB")
-        axes[1].set_xlabel("Seconds from trace start")
-        for axis in axes:
-            axis.grid(alpha=0.25)
-            if axis.lines:
-                axis.legend()
-        fig.tight_layout()
-        path = out / "resource_timeseries.png"
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-        files.append(path.name)
-        for series_map, title, ylabel, filename, scale in (
-            (cgroup_cpu, "CPU cores", "CPU cores", "resource_cpu_cores.png", 1.0),
-            (cgroup_memory, "Memory MiB", "Memory MiB", "resource_memory_mib.png", 1.0 / (1024 * 1024)),
-        ):
-            fig, ax = plt.subplots(figsize=(10, 4.5))
-            for label, series in series_map.items():
-                ax.plot(range(len(series)), [value * scale for _, value in series], marker="." if len(series) < 200 else None, label=label)
-            ax.set_title(title)
-            ax.set_xlabel("Sequence")
-            ax.set_ylabel(ylabel)
-            ax.grid(alpha=0.25)
-            ax.legend()
-            fig.tight_layout()
-            path = out / filename
-            fig.savefig(path, dpi=160)
-            plt.close(fig)
-            files.append(path.name)
-
-    if prom_dir and not (cgroup_cpu or cgroup_memory):
-        fig, axes = plt.subplots(2, 1, figsize=(15, 9), sharex=True)
-        cpu_files = ["cpu_openclaw.json", "cpu_openshell.json", "cpu_sandbox.json"]
-        mem_files = ["memory_openclaw.json", "memory_openshell.json", "memory_sandbox.json"]
-        cpu_series: dict[str, list[tuple[float, float]]] = {}
-        memory_series: dict[str, list[tuple[float, float]]] = {}
-        for filename in cpu_files:
-            series = _prom_series(prom_dir / filename)
-            if series:
-                cpu_series[filename.removesuffix(".json")] = series
-        for filename in mem_files:
-            series = _prom_series(prom_dir / filename)
-            if series:
-                memory_series[filename.removesuffix(".json")] = series
-        all_timestamps = [ts for series in [*cpu_series.values(), *memory_series.values()] for ts, _ in series]
-        origin = min(all_timestamps) if all_timestamps else 0.0
-        for label, series in cpu_series.items():
-            axes[0].plot([ts - origin for ts, _ in series], [value for _, value in series], label=label)
-        for label, series in memory_series.items():
-            axes[1].plot([ts - origin for ts, _ in series], [value / (1024 * 1024) for _, value in series], label=label)
-        axes[0].set_title("OpenClaw And OpenShell Multi-Turn Profiling Analysis - CPU [cores]")
-        axes[0].set_ylabel("CPU cores")
-        axes[1].set_title("OpenClaw And OpenShell Multi-Turn Profiling Analysis - Memory [MiB]")
-        axes[1].set_ylabel("MiB")
-        axes[1].set_xlabel("Seconds from benchmark window start")
-        for axis in axes:
-            axis.grid(alpha=0.25)
-            if axis.lines:
-                axis.legend()
-        fig.tight_layout()
-        path = out / "resource_timeseries.png"
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-        files.append(path.name)
-        for series_map, title, ylabel, filename, scale in (
-            (cpu_series, "OpenClaw and OpenShell CPU", "CPU cores", "resource_cpu_cores.png", 1.0),
-            (memory_series, "OpenClaw and OpenShell memory", "Memory MiB", "resource_memory_mib.png", 1.0 / (1024 * 1024)),
-        ):
-            if not series_map:
-                continue
-            fig, ax = plt.subplots(figsize=(10, 4.5))
-            for label, series in series_map.items():
-                ax.plot([ts - origin for ts, _ in series], [value * scale for _, value in series], label=label)
-            ax.set_title(title)
-            ax.set_xlabel("Seconds from benchmark window start")
-            ax.set_ylabel(ylabel)
-            ax.grid(alpha=0.25)
-            ax.legend()
-            fig.tight_layout()
-            path = out / filename
-            fig.savefig(path, dpi=160)
-            plt.close(fig)
-            files.append(path.name)
-    return files
-
-
 def profile(*, traces: Path, mock_edges: Path | None, out: Path, prom: Path | None = None, driver_requests: Path | None = None, sandbox_lifecycle: Path | None = None) -> dict[str, Any]:
     raw = _load_json(traces)
     if isinstance(raw, dict):
         raw = raw.get("data") or raw.get("traces") or []
     edges = _load_jsonl(mock_edges)
     driver_requests_rows = _load_driver_requests(driver_requests)
+    measured_window = None
+    if driver_requests:
+        try:
+            driver_summary = _load_json(driver_requests.parent / "summary.json")
+            measured_window = (float(driver_summary["start_unix"]), float(driver_summary["end_unix"]))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
     edge_trace_ids = {str(edge.get("trace_id") or "") for edge in edges if edge.get("trace_id")}
     if edge_trace_ids:
         raw = [trace for trace in raw if str(trace.get("traceID") or "") in edge_trace_ids]
@@ -1228,14 +720,14 @@ def profile(*, traces: Path, mock_edges: Path | None, out: Path, prom: Path | No
             writer.writerows(tool_rows)
     # Refresh the baseline-compatible timing artifact from the same raw span
     # set.  Keeping this in the profiling step prevents stale timing buckets
-    # from being mixed with newly generated per-turn plots.
+    # from being mixed with newly generated per-turn tables.
     timing_segments = _timing_segments_for_logical_rows(
         compute_timing_segments(raw),
         rows,
     )
     (traces.parent / "timing_segments.json").write_text(json.dumps(timing_segments, indent=2), encoding="utf-8")
     (out / "timing_segments.json").write_text(json.dumps(timing_segments, indent=2), encoding="utf-8")
-    direct_keys = ["context_assembly_ms", "model_call_ms", "ttft_ms", "response_processing_ms", "tool_dispatch_ms", "exec_ms", "tool_failure_ms"]
+    direct_keys = ["context_assembly_ms", "model_call_ms", "context_to_model_end_ms", "ttft_ms", "response_processing_ms", "tool_dispatch_ms", "exec_ms", "tool_failure_ms"]
     summary = {
         "schema": "openclaw-profiler-v2",
         "turns": len(rows),
@@ -1243,8 +735,10 @@ def profile(*, traces: Path, mock_edges: Path | None, out: Path, prom: Path | No
         "observation_units": sorted({row["observation_unit"] for row in rows}),
         "direct_measurements": {key: _stats([row[key] for row in rows if row.get(key) is not None]) for key in direct_keys},
         "baseline_buckets": {
-            "context_assembly_ms": _stats([row["context_assembly_window_ms"] for row in rows if row.get("context_assembly_window_ms") is not None]),
-            "context_span_direct_ms": _stats([row["context_assembly_ms"] for row in rows if row.get("context_assembly_ms") is not None]),
+            "context_assembly_ms": _stats([row["context_assembly_bucket_ms"] for row in rows if row.get("context_assembly_bucket_ms") is not None]),
+            "context_assembly_complete_request_ms": _stats([row["context_assembly_received_ms"] for row in rows if row.get("context_assembly_received_ms") is not None]),
+            "context_assembly_legacy_model_start_ms": _stats([row["context_assembly_window_ms"] for row in rows if row.get("context_assembly_window_ms") is not None]),
+            "context_span_direct_ms": _stats([row["context_span_direct_ms"] for row in rows if row.get("context_span_direct_ms") is not None]),
             "prompt_boundary_ms": _stats([row["prompt_boundary_ms"] for row in rows if row.get("prompt_boundary_ms") is not None]),
             "response_processing_ms": _stats([row["response_processing_full_ms"] for row in rows if row.get("response_processing_full_ms") is not None]),
             "sandbox_execution_ms": _stats([row["exec_ms"] for row in rows if row.get("exec_ms") is not None]),
@@ -1260,24 +754,23 @@ def profile(*, traces: Path, mock_edges: Path | None, out: Path, prom: Path | No
         },
         "coverage": {key: sum(row.get(key) is not None for row in rows) for key in direct_keys},
         "definitions": {
-            "context_assembly_ms": "OpenClaw trace window from the previous tool/run boundary to the next model call.",
+            "context_assembly_ms": "Per-turn interval from this transition's tool-result span end (or the first harness-run start) to complete request-body receipt at the model endpoint. Missing or unordered boundaries have no value; this includes agent preparation and request transfer, not only prompt-building CPU time.",
+            "context_assembly_received_ms": "Same per-turn complete-request boundary as context_assembly_ms; requires an OpenClaw model span joined to the mock edge by parent span ID.",
             "context_span_direct_ms": "Direct openclaw.context.assembled span only when its timestamps are within the run and have no clock-skew warning; otherwise it is excluded.",
             "model_call_ms": "Supporting provider span; excluded from the baseline overhead buckets.",
-            "response_processing_ms": "openclaw.model.call end to first tool start or next model start.",
+            "context_to_model_end_ms": "Elapsed time from the prior tool-result or initial harness boundary through model-call completion. This is the union of context assembly and model call, without double-counting request transfer.",
+            "response_processing_ms": "OpenClaw model-call end to the start of the first measured OpenShell execution span; includes the pre-execution handoff. If no execution span exists, ends at the tool wrapper or next model call. This is elapsed time, not attributed CPU time.",
+            "response_processing_to_tool_start_ms": "OpenClaw model-call end to the start of the outer tool wrapper; a narrower diagnostic interval.",
+            "pre_execution_gap_ms": "Outer tool wrapper start to the start of the measured OpenShell execution span; included in response_processing_ms when both spans exist.",
+            "tool_dispatch_ms": "Legacy name for the complete outer OpenClaw tool-call span; overlaps response_processing_ms and sandbox_execution_ms and is called tool_call_total_ms in the new latency tables.",
             "response_processing_full_ms": "First streamed model event to next prompt minus mock decode and sandbox execution; baseline-style agent processing bucket.",
             "sandbox_execution_ms": "Sum of openclaw.exec spans, falling back to openclaw.tool.execution when the newer schema omits openclaw.exec.",
             "sandbox_initialization_ms": "Measured prewarm request through OpenClaw and OpenShell using a harmless exec before the first replay turn; pod create-to-ready remains separately recorded as cold-start evidence.",
             "sandbox_cold_exec_ms": "Compatibility field containing the first actual openclaw.exec command duration; it is command execution and must not be interpreted as cold-start or warm-pool initialization.",
-            "context_per_turn_latency": "Measured through the driver/mock prompt boundary because the native OpenClaw event is run-level only.",
+            "context_per_turn_latency": "Measured from OpenClaw's tool-result/harness boundary through the mock model endpoint's complete request receipt. The native OpenClaw context.assembled event is run-level only in the deployed image.",
             "prompt_boundary_ms": "Driver send to the first mock prompt, then previous mock turn end to the next mock prompt; includes all OpenClaw work in that observable boundary.",
         },
-        "plot_definitions": {
-            "latency_waterfall": "Readable overhead waterfall: pre-LLM preparation, response processing, unattributed tool-dispatch gap, and actual OpenShell command execution. Model latency is excluded from this primary chart; long outliers are marked off-scale.",
-            "latency_waterfall_full_range": "Full measured request-to-tool cycle in order, including LLM call and long OpenShell dispatch/wait intervals.",
-            "openclaw_openshell_per_turn": "Per-turn observed OpenClaw boundary/dispatch overhead versus actual OpenShell execution; full gaps are retained here and are not relabeled as sandbox execution.",
-            "resource_plots": "Run-local cgroup-v2 CPU and memory samples for the OpenClaw gateway and OpenShell sandbox.",
-        },
-        "plots": _plots(rows, prom, out / "diagrams"),
+        "tables": write_profile_tables(rows, tool_rows, prom, out / "tables", measured_window),
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (out / "PROFILE.md").write_text(
