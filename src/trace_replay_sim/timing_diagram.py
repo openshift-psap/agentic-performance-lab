@@ -1,14 +1,4 @@
-"""Render the per-turn 5-bucket session waterfall from derive.py output.
 
-Consumes ``per_turn.json`` (produced by ``trace_replay_sim.derive``) and renders a
-horizontal stacked-bar waterfall: one row per turn, five buckets per row in
-execution order A -> C -> E -> D -> B. Turn 0 is heaviest (cold sandbox). Also
-renders a cross-layer E2E comparison from the driver summaries.
-
-Usage:
-  python3 -m trace_replay_sim.timing_diagram --per-turn results/derive/per_turn.json \
-      --out results/diagrams
-"""
 
 from __future__ import annotations
 
