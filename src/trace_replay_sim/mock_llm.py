@@ -1,27 +1,4 @@
-"""Stdlib OpenAI-compatible mock LLM that deterministically replays recorded turns.
 
-Design goals (rewritten from scratch):
-
-* **Controlled model time, not fitted.** Per-turn model time is a deterministic
-  function of a *named profile* and the turn's recorded ``output_tokens``:
-  ``model_ms = TTFT + max(0, output_tokens - 1) * ITL`` with BOTH TTFT and ITL
-  taken from the profile. The recorded ``duration_ms`` is E2E wall-clock (tool +
-  network + think time), NOT decode, so it is kept only as a sanity reference and
-  never used to derive timing.
-
-* **Skew-free per-turn edges.** Each request records ``t_recv`` / ``t_first_emit``
-  / ``t_end_emit`` on a single monotonic clock. Downstream, the inter-turn gap
-  ``G[i] = t_recv[i+1] - t_end_emit[i]`` (same clock, same process) is the
-  authoritative skew-free bound on OpenClaw+OpenShell overhead between model calls.
-
-* **Redundant, self-validating correlation.** Every edge record carries four
-  independent keys so the analyzer can join on the strongest present and
-  cross-check the rest: ``(trace_id, parent_span_id)`` from the incoming
-  ``traceparent`` (authoritative Jaeger join to OpenClaw's ``model.call`` span),
-  ``session_id`` (grouping), a mock per-session monotonic ``turn_seq`` (single-clock
-  ordering that holds even with zero spans), and a global ``request_seq`` +
-  monotonic ``t_recv_ns`` (ultimate ordering / retry-dedup fallback).
-"""
 
 from __future__ import annotations
 
@@ -57,22 +34,6 @@ DELAY_PROFILES: dict[str, tuple[float, float]] = {
 
 DEFAULT_PROFILE = "rhaiis"
 
-# --------------------------------------------------------------------------- #
-# Prefill scaling (prefix-cache aware).  A real LLM prefills the assembled       #
-# prompt before it emits the first token, so TTFT grows with context size.       #
-# But with prefix/KV caching, only the NEW tokens the gateway appended this turn  #
-# are actually prefilled -- the shared prefix from earlier turns is a cache hit.  #
-# So within a session: turn 0 prefills the WHOLE context cold (heavy TTFT), and   #
-# later turns prefill only the per-turn DELTA (cheap).  This reconciles the       #
-# baseline: the 51ms->804ms TTFT jump (110->7862 prompt tokens) is the cold       #
-# turn-0 prefill; warm turns collapse back toward the profile TTFT.               #
-# Calibrated to the 8xA100 Qwen3-8B HumanEval baseline (GuideLLM, C=1, P50):     #
-#   vLLM     117 tok -> 51.3 ms TTFT                                             #
-#   OpenClaw 7862 tok -> 804.5 ms TTFT                                           #
-#   => prefill ~0.0972 ms/token, base ~40 ms.  The profile TTFT is the value at #
-#   PREFILL_REF_TOKENS, so we add prefill only for the uncached (new) context.   #
-# NOTE: the /no_think baseline's TTFT is prefill + shell gateway overhead, NOT   #
-# reasoning (its <think> blocks are empty -- all layers ran "/no_think").         #
 PREFILL_PER_TOKEN_MS = float(os.environ.get("MOCK_PREFILL_PER_TOKEN_MS", "0.0972"))
 PREFILL_REF_TOKENS = int(os.environ.get("MOCK_PREFILL_REF_TOKENS", "117"))
 
@@ -117,30 +78,6 @@ def prefill_ttft_ms(base_ttft_ms: float, new_tokens: int | None) -> float:
     return base_ttft_ms + PREFILL_PER_TOKEN_MS * max(0, int(new_tokens))
 
 
-# --------------------------------------------------------------------------- #
-# Reasoning preamble (REALISTIC "thinking ON" mode).  A reasoning model (Qwen3) #
-# emits a <think>...</think> block BEFORE any visible content.  OpenClaw's       #
-# tool-call detection pipeline classifies every streamed chunk                   #
-# (Text/ToolCall/ThinkingContent) and BUFFERS the reasoning block before         #
-# releasing the first CLIENT-visible token -- verified live: enabling reasoning   #
-# on the real openclaw-shell gateway delayed first-visible token by +1782ms and  #
-# swallowed the reasoning content.  The mock reproduces this by streaming N       #
-# reasoning tokens FIRST (paced at the profile ITL) so OpenClaw does the real     #
-# buffering work; nothing is hardcoded.                                          #
-#                                                                                #
-# IMPORTANT: this is NOT what the 8xA100 baseline measured.  That benchmark ran  #
-# "/no_think" on ALL layers (vLLM/openclaw/shell) -- its <think> blocks are       #
-# empty, so its 895ms "Response Processing" is prefill + shell overhead, not     #
-# reasoning.  Reasoning models the PRODUCTION case the /no_think baseline         #
-# deliberately excluded; it is an explicit, DOCUMENTED workload parameter, not a  #
-# fit to any baseline number.  The count has no GPU-measured ground truth here,   #
-# so treat it as a swept assumption.                                             #
-#                                                                                #
-# The reasoning count is carved OUT of the turn's recorded output_tokens (total  #
-# decode is unchanged) -- it only moves where the first VISIBLE token lands.     #
-# Resolution per turn: the turn's own "reasoning_tokens" field, else             #
-# MOCK_REASONING_TOKENS (fixed count), else MOCK_REASONING_FRACTION *            #
-# output_tokens.  Default 0 -> off (honest no-reasoning stream).                 #
 REASONING_TOKENS_ENV = os.environ.get("MOCK_REASONING_TOKENS")      # fixed count, optional
 REASONING_FRACTION = float(os.environ.get("MOCK_REASONING_FRACTION", "0"))
 # "think_tags": <think>..</think> inside content deltas (raw model; OpenClaw parses the tags).
