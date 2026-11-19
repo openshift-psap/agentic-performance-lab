@@ -5633,6 +5633,14 @@ def collect_trace(
         backend_event_name=backend.event_name,
     )
     write_report(trace_dir, conformance)
+    for check in conformance.get("checks", []):
+        if check.get("status") == "WARN":
+            LOG.warning(
+                "functional conformance warning for %s: %s: %s",
+                session_id,
+                check.get("name"),
+                check.get("details") or "",
+            )
     if not conformance.get("passed"):
         failed_checks = [check["name"] for check in conformance.get("checks", []) if check.get("status") == "FAIL"]
         raise RuntimeError(f"functional conformance failed for {session_id}: {', '.join(failed_checks)}")
@@ -6997,10 +7005,37 @@ def main() -> int:
             futures = [pool.submit(run_one, position, item) for position, item in enumerate(queue)]
             results = [future.result() for future in as_completed(futures)]
         failed = [result for result in results if not result.get("ok")]
+        exit_code_warnings = []
+        for report_path in sorted((args.out / "traces").glob("*/functional_conformance.json")):
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for check in report.get("checks") or []:
+                if check.get("name") != "swe_recorded_exit_codes" or check.get("status") != "WARN":
+                    continue
+                exit_code_warnings.append({
+                    "session_id": str(report.get("session_id") or report_path.parent.name),
+                    "mismatched_turns": int(check.get("mismatched_turns") or 0),
+                    "turn_indices": list(check.get("mismatched_turn_indices") or []),
+                })
+        if exit_code_warnings:
+            LOG.warning(
+                "recorded exit codes differ in %d of %d replayed sessions "
+                "(%d turns ended with a different exit code): %s",
+                len(exit_code_warnings),
+                len(results),
+                sum(item["mismatched_turns"] for item in exit_code_warnings),
+                "; ".join(
+                    f"{item['session_id']}={item['mismatched_turns']} turn(s) {item['turn_indices']}"
+                    for item in exit_code_warnings
+                ),
+            )
         (args.out / "run_summary.json").write_text(json.dumps({
             "total": len(results),
             "completed": len(results) - len(failed),
             "failed": len(failed),
+            "exit_code_warnings": exit_code_warnings,
             "agents": len(agent_bindings),
             "execution_workers": execution_workers,
             "tool_cpu_ids": list(tool_cpu_ids),

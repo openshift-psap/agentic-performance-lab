@@ -87,3 +87,59 @@ def test_swe_conformance_rejects_new_missing_dependency_even_with_zero_exit(tmp_
                           backend_events=[event])
     assert report["status"] == "FAIL"
     assert "swe_dependency_failures" in [check["name"] for check in report["checks"] if check["status"] == "FAIL"]
+
+
+def _verify_swe_trace(tmp_path: Path, *, sandbox_exit_codes: list[int]):
+    trace = tmp_path / "swe-trace"
+    (trace / "data/shell/profile-v2/tables").mkdir(parents=True)
+    (trace / "data/shell").mkdir(exist_ok=True)
+    arguments = [{"command": f"python3 -m pytest tests/test_{turn}.py"} for turn in range(len(sandbox_exit_codes))]
+    session = {
+        "session_id": "swe-1",
+        "swe_task": {"base_commit": "abc"},
+        "turns": [
+            {"index": turn, "tool_calls": [{"name": "mcp__environment__bash",
+                                            "arguments": call_arguments,
+                                            "recorded_result": json.dumps({"output": "2 passed", "returncode": 0})}]}
+            for turn, call_arguments in enumerate(arguments)
+        ],
+    }
+    (trace / "input_corpus.json").write_text(json.dumps({"sessions": [session]}))
+    (trace / "data/shell/mock_edges.jsonl").write_text("\n".join(json.dumps({
+        "session_id": "swe-1", "turn_seq": turn, "n_tool_calls": 1,
+    }) for turn in range(len(arguments))) + "\n")
+    fields = ["turn", "response_processing_ms", "tool_dispatch_overhead_ms",
+              "openshell_exec_ms", "tool_failure_ms"]
+    with (trace / "data/shell/profile-v2/tables/per_turn_efficiency.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for turn in range(len(arguments)):
+            writer.writerow({**dict.fromkeys(fields, 0), "turn": turn})
+    events = [
+        {"event": "swebench_tool", "session_id": "swe-1", "tool": "mcp__environment__bash",
+         "turn": turn, "call": 0, "arguments_sha256": arguments_sha256(call_arguments),
+         "execution_mode": "sandbox", "sandbox_base_commit": "abc",
+         "sandbox_returncode": code, "sandbox_dependency_failure": False}
+        for turn, (call_arguments, code) in enumerate(zip(arguments, sandbox_exit_codes))
+    ]
+    return verify_trace(trace, backend_kind="swebench", backend_event_name="swebench_tool",
+                        backend_events=events)
+
+
+def test_swe_matching_exit_codes_pass(tmp_path):
+    report = _verify_swe_trace(tmp_path, sandbox_exit_codes=[0, 0])
+    assert report["status"] == "PASS"
+    exit_code_check = next(check for check in report["checks"] if check["name"] == "swe_recorded_exit_codes")
+    assert exit_code_check["status"] == "PASS"
+
+
+def test_swe_exit_code_mismatch_warns_without_failing(tmp_path):
+    report = _verify_swe_trace(tmp_path, sandbox_exit_codes=[0, 1])
+    assert report["status"] == "PASS_WITH_WARNINGS"
+    assert report["passed"] is True
+    exit_code_check = next(check for check in report["checks"] if check["name"] == "swe_recorded_exit_codes")
+    assert exit_code_check["status"] == "WARN"
+    assert exit_code_check["mismatched_turns"] == 1
+    assert exit_code_check["mismatched_turn_indices"] == [1]
+    assert "1 of 2 measured turns" in exit_code_check["details"]
+    assert report["warnings"] == ["swe_recorded_exit_codes"]
