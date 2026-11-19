@@ -1,19 +1,9 @@
 """Load generator: replay recorded user sessions against a harness endpoint.
 
-Plays the GuideLLM role: the *client-edge* ground truth. In the openclaw/shell
+user role: the *client-edge* ground truth. In the openclaw/shell
 layers the driver is only the user: it sends one request at the recorded turn 0
-and at every later recorded user message (``--client-turns``), and the harness
-owns the tool loop in between. Each request is one ``openclaw.run`` that can
-internally loop N model calls, so the driver observes **client-edge** timing
-(t_send, t_first byte, t_end). Per-*turn* skew-free timing is owned by the mock
-(see ``mock_llm.EdgeRecorder``). The legacy ``--session-turns`` mode sends one
-request per recorded model turn and is retained for old exports. In the
-mock-direct layer each request IS a single turn, so the driver's session edges
-are also that turn's edges and provide the control net-floor.
-
-The driver generates a W3C ``traceparent`` per request and propagates it so
-driver -> harness -> model/tool spans can stitch into one trace, and exports
-its own session span via OTLP (best effort).
+and at every later recorded user message (``--client-turns``), and the agent
+owns the tool loop in between. 
 """
 
 from __future__ import annotations
