@@ -7,7 +7,7 @@ the mock clock, Jaeger tool spans, and the driver SSE timeline:
 * ``first_event_to_tool_ms``: first mock event -> OpenClaw tool span start.
 * ``response_processing_post_stream_ms``: final mock event -> tool span start.
 * ``openshell_exec_ms``: OpenClaw tool execution span duration.
-
+* ``model_call``: patr of the context assembly- delivering the prompt to the model and call it. 
 The first-event boundary includes model streaming and any concurrent harness
 work. The post-stream boundary is the narrow response-to-dispatch interval;
 the two must not be confused.
