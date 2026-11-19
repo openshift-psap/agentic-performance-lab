@@ -1,6 +1,5 @@
-"""Load generator: replay recorded user sessions against a harness endpoint.
-
-user role: the *client-edge* ground truth. In the openclaw/shell
+"""
+client side class: the *client-edge* ground truth. In the openclaw/shell
 layers the driver is only the user: it sends one request at the recorded turn 0
 and at every later recorded user message (``--client-turns``), and the agent
 owns the tool loop in between. 
