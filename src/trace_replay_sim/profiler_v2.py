@@ -1,8 +1,8 @@
-"""Evidence-first multi-turn profiler for OpenClaw/OpenShell.
+"""multi-turn profiler for OpenClaw/OpenShell-
 
 This module intentionally does not reuse the legacy A-E residual buckets.  It
-joins official OpenClaw OTEL spans with the mock's monotonic edge clock and
-reports direct measurements separately from derived proxies.
+joins official OpenClaw OTEL spans with the sim edge clock and
+reports measurements separately from derived proxies.
 """
 
 from __future__ import annotations
