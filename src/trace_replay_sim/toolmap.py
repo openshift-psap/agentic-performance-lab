@@ -1,4 +1,4 @@
-"""Map recorded agent tools onto OpenShell exec commands."""
+"""Map recorded agent tools onto OpenShell."""
 
 from __future__ import annotations
 
