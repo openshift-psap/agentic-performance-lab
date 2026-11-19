@@ -1,4 +1,3 @@
-"""CLI for the OpenClaw/OpenShell trace-replay simulator."""
 
 from __future__ import annotations
 
