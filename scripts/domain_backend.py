@@ -13,6 +13,7 @@ official SWE-bench, BrowseComp, or τ-bench evaluation correctness.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -48,16 +49,91 @@ def arguments_sha256(arguments: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _json_result_with_byte_budget(value: Any, byte_budget: int | None) -> tuple[str, bool]:
+    """Serialize real retrieval data within the recorded response-size budget.
+
+    Long indexed text is shortened at UTF-8 boundaries. When the resulting JSON
+    is shorter than the recorded byte count, trailing JSON whitespace preserves
+    the response size without adding invented document content.
+    """
+    separators = (",", ":")
+    serialized = json.dumps(value, ensure_ascii=False, separators=separators)
+    if byte_budget is None:
+        return serialized, False
+    if byte_budget < 0:
+        raise ValueError("recorded result size cannot be negative")
+    original_size = len(serialized.encode("utf-8"))
+    if original_size <= byte_budget:
+        return serialized + (" " * (byte_budget - original_size)), False
+
+    bounded = copy.deepcopy(value)
+    text_slots: list[tuple[dict[str, Any], str, bytes]] = []
+    candidates = bounded if isinstance(bounded, list) else [bounded]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and isinstance(candidate.get("text"), str):
+            text_slots.append((candidate, "text", candidate["text"].encode("utf-8")))
+    if not text_slots:
+        raise ValueError(
+            f"recorded result byte budget {byte_budget} is too small for the retrieval response envelope"
+        )
+
+    for candidate, field, _ in text_slots:
+        candidate[field] = ""
+    minimum = json.dumps(bounded, ensure_ascii=False, separators=separators)
+    minimum_size = len(minimum.encode("utf-8"))
+    if minimum_size > byte_budget:
+        raise ValueError(
+            f"recorded result byte budget {byte_budget} is too small for the retrieval response envelope ({minimum_size} bytes)"
+        )
+
+    total_text_bytes = sum(len(raw) for _, _, raw in text_slots)
+    remaining_budget = byte_budget - minimum_size
+    serialized = minimum
+    # Escaped characters can use more bytes than their UTF-8 source. Recompute
+    # the proportional content allowance until it fits, then add whitespace.
+    for _ in range(32):
+        for candidate, field, raw in text_slots:
+            per_text_budget = (
+                round(len(raw) * remaining_budget / total_text_bytes)
+                if total_text_bytes else 0
+            )
+            candidate[field] = raw[:per_text_budget].decode("utf-8", errors="ignore")
+        serialized = json.dumps(bounded, ensure_ascii=False, separators=separators)
+        actual_size = len(serialized.encode("utf-8"))
+        if actual_size <= byte_budget:
+            return serialized + (" " * (byte_budget - actual_size)), True
+        remaining_budget = max(0, remaining_budget - (actual_size - byte_budget) - 1)
+    raise ValueError("could not fit actual retrieval text into the recorded response-size budget")
+
+
 def now_ns() -> int:
     return time.clock_gettime_ns(getattr(time, "CLOCK_MONOTONIC_RAW", time.CLOCK_MONOTONIC))
 
 
 class DomainBackend:
-    def __init__(self, workload: str, root: Path):
+    def __init__(
+        self,
+        workload: str,
+        root: Path,
+        *,
+        research_mode: str = "synthetic",
+        browsecomp_index_path: str = "",
+        browsecomp_k: int = 5,
+    ):
         if workload not in EVENT_NAMES:
             raise ValueError(f"unsupported domain workload: {workload}")
+        if research_mode not in {"synthetic", "browsecompplus"}:
+            raise ValueError(f"unsupported research mode: {research_mode}")
+        if workload == "research_deep_search" and research_mode == "browsecompplus" and not browsecomp_index_path:
+            raise ValueError("BrowseComp-Plus mode requires --browsecomp-index-path or BROWSECOMP_INDEX_PATH")
         self.workload = workload
         self.root = root
+        self.research_mode = research_mode if workload == "research_deep_search" else "not_applicable"
+        self.browsecomp = (
+            BrowseCompPlusBM25(browsecomp_index_path, browsecomp_k)
+            if self.research_mode == "browsecompplus"
+            else None
+        )
         self.root.mkdir(parents=True, exist_ok=True)
         self.sessions: dict[str | tuple[str, str], dict[str, Any]] = {}
         self.events: list[dict[str, Any]] = []
@@ -75,6 +151,7 @@ class DomainBackend:
             "authenticated": False,
             "documents_read": [],
             "searches": [],
+            "submissions": [],
             "files_touched": [],
             "tests_run": 0,
             "support_updates": 0,
@@ -122,6 +199,12 @@ class DomainBackend:
         arguments: dict[str, Any],
         recorded_result_bytes: int | None = None,
     ) -> str:
+        if self.research_mode == "browsecompplus":
+            response, _, _ = self._browsecompplus_result(
+                state, tool, arguments, recorded_result_bytes
+            )
+            return response
+
         query = str(arguments.get("query") or arguments.get("q") or arguments.get("url") or tool)
         lowered = tool.lower()
         if any(word in lowered for word in ("search", "query", "find")):
@@ -167,6 +250,62 @@ class DomainBackend:
         item[text_field] = (words * ((padding // len(words)) + 1))[:padding]
         return json.dumps(result)
 
+    def _browsecompplus_result(
+        self,
+        state: dict[str, Any],
+        tool: str,
+        arguments: dict[str, Any],
+        recorded_result_bytes: int | None,
+    ) -> tuple[str, list[str], bool]:
+        if self.browsecomp is None:
+            raise RuntimeError("BrowseComp-Plus retriever is not configured")
+        lowered = tool.lower()
+        retrieved_docids: list[str] = []
+        if lowered.endswith("search"):
+            query = str(arguments.get("query") or arguments.get("q") or arguments.get("url") or "")
+            if not query:
+                raise ValueError("BrowseComp-Plus search requires a non-empty query")
+            with self.lock:
+                state["searches"].append(query)
+            result = self.browsecomp.search(query)
+            retrieved_docids = [str(item["docid"]) for item in result if item.get("docid") is not None]
+        elif "get_document" in lowered:
+            docid = str(
+                arguments.get("docid")
+                or arguments.get("doc_id")
+                or arguments.get("document_id")
+                or arguments.get("id")
+                or ""
+            )
+            if not docid:
+                raise ValueError("BrowseComp-Plus get_document requires docid or id")
+            with self.lock:
+                state["documents_read"].append(docid)
+            result = self.browsecomp.get_document(docid)
+            if result is not None:
+                retrieved_docids = [str(result["docid"])]
+        elif lowered.endswith("submit"):
+            if "exact_answer" not in arguments:
+                raise ValueError("BrowseComp-Plus submit requires exact_answer")
+            with self.lock:
+                state["submissions"].append({
+                    "exact_answer": str(arguments.get("exact_answer") or ""),
+                    "explanation": str(arguments.get("explanation") or ""),
+                    "confidence": arguments.get("confidence"),
+                })
+            # Submission is recorded locally; answer scoring is outside this
+            # replay backend. BrowseComp-Plus traces return null or empty text.
+            result = None
+        else:
+            raise ValueError(f"unsupported BrowseComp-Plus tool: {tool}")
+
+        if recorded_result_bytes == 0:
+            # Still execute the real lookup and preserve its IDs in the audit
+            # event, but keep an empty recorded tool response empty.
+            return "", retrieved_docids, bool(result)
+        response, truncated = _json_result_with_byte_budget(result, recorded_result_bytes)
+        return response, retrieved_docids, truncated
+
     def _support_result(
         self, state: dict[str, Any], tool: str, arguments: dict[str, Any],
         recorded_result_bytes: int | None = None,
@@ -206,10 +345,19 @@ class DomainBackend:
             return {"ok": False, "error": "invalid replay run key"}
         arguments = dict(request.get("arguments") or {})
         started = now_ns()
+        retrieved_docids: list[str] = []
+        response_truncated_to_budget = False
         with self.lock:
             state = self._state(session_id, str(request.get("benchmark") or self.workload), run_key)
             state["version"] += 1
-            if self.workload == "software_engineering_qa":
+            state_version = state["version"]
+            live_research = (
+                self.workload == "research_deep_search"
+                and self.research_mode == "browsecompplus"
+            )
+            if live_research:
+                result = None
+            elif self.workload == "software_engineering_qa":
                 result = self._swe_result(
                     state,
                     tool,
@@ -223,63 +371,135 @@ class DomainBackend:
                 )
             else:
                 result = self._support_result(state, tool, arguments, request.get("recorded_result_bytes"))
-            event = {
-                "event": EVENT_NAMES[self.workload],
-                "timestamp_unix_ns": time.time_ns(),
-                "trace_id": str(request.get("trace_id") or ""),
-                "run_key": run_key,
-                "backend": f"trace-replay-{self.workload}-backend",
-                "session_id": session_id,
-                "workload": self.workload,
-                "benchmark": request.get("benchmark"),
-                "turn": request.get("turn"),
-                "call": request.get("call"),
-                "tool": tool,
-                "arguments_sha256": arguments_sha256(arguments),
-                "elapsed_ms": round((now_ns() - started) / 1e6, 3),
-                "result_bytes": len(result.encode("utf-8")),
-                "state_version": state["version"],
-                "execution_mode": str(request.get("execution_mode") or "backend"),
-            }
-            if request.get("execution_mode") == "sandbox":
-                sandbox_result = request.get("sandbox_result")
-                if isinstance(sandbox_result, dict):
-                    event["sandbox_repo_root"] = str(sandbox_result.get("repo_root") or "")
-                    event["sandbox_base_commit"] = str(sandbox_result.get("base_commit") or "")
-                    event["sandbox_returncode"] = int(sandbox_result.get("returncode") or 0)
-                    # A pipeline such as `pytest | tee` may report status 0
-                    # even when Python printed a genuine import failure.
-                    # Anchor to diagnostic lines so source-code snippets that
-                    # merely mention these strings are not treated as errors.
-                    event["sandbox_dependency_failure"] = bool(re.search(
-                        r"^\s*(?:(?:ModuleNotFoundError|ImportError):|(?:\S*/)?python(?:\d+(?:\.\d+)?)?:\s*No module named\b)",
-                        str(sandbox_result.get("output") or ""), re.IGNORECASE | re.MULTILINE,
-                    ))
-                    if sandbox_result.get("operation") == "command":
-                        for field in (
-                            "command_started_epoch_ns", "command_ended_epoch_ns", "command_wall_ns",
-                            "command_user_cpu_us", "command_system_cpu_us",
-                            "command_voluntary_context_switches", "command_involuntary_context_switches",
-                            "command_minor_faults", "command_major_faults",
-                            "command_effective_cpu_ids", "command_requested_cpu_ids",
-                            "command_cgroup_quota_requested", "command_cgroup_quota_applied",
-                            "command_cgroup_quota_original",
-                            "command_cgroup_usage_usec", "command_cgroup_user_usec",
-                            "command_cgroup_system_usec", "command_cgroup_nr_throttled",
-                            "command_cgroup_throttled_usec", "command_cgroup_pressure_some_usec",
-                            "command_cgroup_pressure_full_usec",
-                        ):
-                            if field in sandbox_result:
-                                event[field] = sandbox_result[field]
-                    if int(sandbox_result.get("returncode") or 0) != 0:
-                        event["sandbox_output_prefix"] = str(sandbox_result.get("output") or "")[:512]
+        if live_research:
+            # Do not hold the session-state lock while the real retriever runs:
+            # concurrent agent searches should be able to reach the local
+            # search index together instead of being serialized by this service.
+            result, retrieved_docids, response_truncated_to_budget = self._browsecompplus_result(
+                state, tool, arguments, request.get("recorded_result_bytes")
+            )
+        event = {
+            "event": EVENT_NAMES[self.workload],
+            "timestamp_unix_ns": time.time_ns(),
+            "trace_id": str(request.get("trace_id") or ""),
+            "run_key": run_key,
+            "backend": f"trace-replay-{self.workload}-backend",
+            "session_id": session_id,
+            "workload": self.workload,
+            "benchmark": request.get("benchmark"),
+            "turn": request.get("turn"),
+            "call": request.get("call"),
+            "tool": tool,
+            "arguments_sha256": arguments_sha256(arguments),
+            "elapsed_ms": round((now_ns() - started) / 1e6, 3),
+            "result_bytes": len(result.encode("utf-8")),
+            "state_version": state_version,
+            "execution_mode": str(request.get("execution_mode") or "backend"),
+        }
+        if self.workload == "research_deep_search":
+            event["retrieval_mode"] = self.research_mode
+            if live_research:
+                if "get_document" in tool.lower() or tool.lower().endswith("search"):
+                    event["response_size_policy"] = "recorded_result_bytes"
+                    event["recorded_result_bytes"] = request.get("recorded_result_bytes")
+                if "get_document" in tool.lower() or tool.lower().endswith("search"):
+                    event["retrieved_docids"] = retrieved_docids
+                    event["response_truncated_to_trace_budget"] = response_truncated_to_budget
+        if request.get("execution_mode") == "sandbox":
+            sandbox_result = request.get("sandbox_result")
+            if isinstance(sandbox_result, dict):
+                event["sandbox_repo_root"] = str(sandbox_result.get("repo_root") or "")
+                event["sandbox_base_commit"] = str(sandbox_result.get("base_commit") or "")
+                event["sandbox_returncode"] = int(sandbox_result.get("returncode") or 0)
+                # A pipeline such as `pytest | tee` may report status 0
+                # even when Python printed a genuine import failure.
+                # Anchor to diagnostic lines so source-code snippets that
+                # merely mention these strings are not treated as errors.
+                event["sandbox_dependency_failure"] = bool(re.search(
+                    r"^\s*(?:(?:ModuleNotFoundError|ImportError):|(?:\S*/)?python(?:\d+(?:\.\d+)?)?:\s*No module named\b)",
+                    str(sandbox_result.get("output") or ""), re.IGNORECASE | re.MULTILINE,
+                ))
+                if sandbox_result.get("operation") == "command":
+                    for field in (
+                        "command_started_epoch_ns", "command_ended_epoch_ns", "command_wall_ns",
+                        "command_user_cpu_us", "command_system_cpu_us",
+                        "command_voluntary_context_switches", "command_involuntary_context_switches",
+                        "command_minor_faults", "command_major_faults",
+                        "command_effective_cpu_ids", "command_requested_cpu_ids",
+                        "command_cgroup_quota_requested", "command_cgroup_quota_applied",
+                        "command_cgroup_quota_original",
+                        "command_cgroup_usage_usec", "command_cgroup_user_usec",
+                        "command_cgroup_system_usec", "command_cgroup_nr_throttled",
+                        "command_cgroup_throttled_usec", "command_cgroup_pressure_some_usec",
+                        "command_cgroup_pressure_full_usec",
+                    ):
+                        if field in sandbox_result:
+                            event[field] = sandbox_result[field]
+                if int(sandbox_result.get("returncode") or 0) != 0:
+                    event["sandbox_output_prefix"] = str(sandbox_result.get("output") or "")[:512]
+        with self.lock:
             self.events.append(event)
         print(json.dumps(event, separators=(",", ":")), flush=True)
         return {"ok": True, "result": result, "state_version": event["state_version"]}
 
 
-def serve(workload: str, host: str, port: int, root: Path) -> None:
-    backend = DomainBackend(workload, root)
+
+class BrowseCompPlusBM25:
+    """Direct adapter around BrowseComp-Plus's upstream BM25 index API.
+
+    It mirrors the upstream BM25 searcher's lookup behavior: search returns
+    ranked document IDs, scores, and full indexed text; get_document reads a
+    full document from the same local Lucene index. No MCP process or network
+    hop is involved. Pyserini and Java are loaded only when this mode is enabled.
+    """
+
+    def __init__(self, index_path: str, k: int = 5):
+        # Pyserini builds an OpenAI client while its lucene search module is
+        # imported. BM25 retrieval never calls that client, and containers
+        # normally carry no OpenAI key, so the import would fail with
+        # "Missing credentials" without a placeholder.
+        os.environ.setdefault("OPENAI_API_KEY", "unused-by-browsecomp-backend")
+        from pyserini.search.lucene import LuceneSearcher
+
+        if k < 1:
+            raise ValueError("BrowseComp-Plus result count must be positive")
+        self.searcher = LuceneSearcher(index_path)
+        self.k = k
+
+    @staticmethod
+    def _contents(raw_document: str) -> str:
+        payload = json.loads(raw_document)
+        return str(payload["contents"])
+
+    def search(self, query: str) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for hit in self.searcher.search(query, self.k):
+            text = self._contents(hit.lucene_document.get("raw"))
+            results.append({"docid": hit.docid, "score": hit.score, "text": text})
+        return results
+
+    def get_document(self, docid: str) -> dict[str, str] | None:
+        document = self.searcher.doc(docid)
+        if document is None:
+            return None
+        return {"docid": docid, "text": self._contents(document.raw())}
+
+def serve(
+    workload: str,
+    host: str,
+    port: int,
+    root: Path,
+    research_mode: str,
+    browsecomp_index_path: str,
+    browsecomp_k: int,
+) -> None:
+    backend = DomainBackend(
+        workload,
+        root,
+        research_mode=research_mode,
+        browsecomp_index_path=browsecomp_index_path,
+        browsecomp_k=browsecomp_k,
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *values: Any) -> None:
@@ -295,7 +515,13 @@ def serve(workload: str, host: str, port: int, root: Path) -> None:
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/health":
-                self.send_json(200, {"status": "ok", "workload": workload, "events": len(backend.events)})
+                self.send_json(200, {
+                    "status": "ok",
+                    "workload": workload,
+                    "research_mode": backend.research_mode,
+                    "browsecomp_index_loaded": backend.browsecomp is not None,
+                    "events": len(backend.events),
+                })
             elif self.path == "/events":
                 self.send_json(200, {"events": backend.events})
             else:
@@ -324,8 +550,33 @@ def main() -> int:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--root", default="/data/sessions")
+    parser.add_argument(
+        "--research-mode",
+        choices=("synthetic", "browsecompplus"),
+        default=os.environ.get("TRACE_REPLAY_RESEARCH_MODE", "synthetic"),
+        help="Use the legacy synthetic research response or direct BrowseComp-Plus BM25 retrieval.",
+    )
+    parser.add_argument(
+        "--browsecomp-index-path",
+        default=os.environ.get("BROWSECOMP_INDEX_PATH", ""),
+        help="Path to the local BrowseComp-Plus BM25 Lucene index.",
+    )
+    parser.add_argument(
+        "--browsecomp-k",
+        type=int,
+        default=int(os.environ.get("BROWSECOMP_K", "5")),
+        help="Number of BrowseComp-Plus BM25 hits to return (default: 5).",
+    )
     args = parser.parse_args()
-    serve(args.workload, args.host, args.port, Path(args.root))
+    serve(
+        args.workload,
+        args.host,
+        args.port,
+        Path(args.root),
+        args.research_mode,
+        args.browsecomp_index_path,
+        args.browsecomp_k,
+    )
     return 0
 
 

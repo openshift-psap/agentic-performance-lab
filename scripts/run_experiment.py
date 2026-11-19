@@ -2,9 +2,10 @@
 """Single entrypoint for the workload-partitioned OpenClaw benchmark.
 
 The controller deliberately keeps deployment, execution, collection and
-analysis in one trace-first lifecycle. It creates only ``trace-replay-*``
-resources, never deletes resources, and requires ``--execute`` for cluster
-mutation. ``--plan`` is safe and is useful for validating the corpus first.
+analysis in one trace-first lifecycle. It scopes resources to the configured
+``RESOURCE_PREFIX``, deletes only temporary objects carrying its ownership
+label, and requires ``--execute`` for cluster mutation. ``--plan`` is safe and
+is useful for validating the corpus first.
 """
 
 from __future__ import annotations
@@ -2396,7 +2397,7 @@ def ensure_workload_backends(
     """Deploy/check only explicitly configured, experiment-owned backends.
 
     A managed backend manifest must contain resources whose names begin with
-    ``trace-replay-``. Existing managed resources must carry this experiment's
+    the configured ``RESOURCE_PREFIX``. Existing managed resources must carry this experiment's
     ownership label before they are updated. Source changes roll only those
     owned backend deployments. This function has no generic fixture fallback.
     """
@@ -2404,7 +2405,13 @@ def ensure_workload_backends(
     for workload in allocation:
         spec = backends[workload]
         if spec.deployment_mode == "managed":
-            for kind, name in (("deployment", spec.name), ("service", spec.service)):
+            owned_objects = [("deployment", spec.name), ("service", spec.service)]
+            if spec.benchmark == "browsecompplus":
+                owned_objects.append((
+                    "persistentvolumeclaim",
+                    spec.pvc or f"{RESOURCE_PREFIX}-browsecompplus-index",
+                ))
+            for kind, name in owned_objects:
                 raw = cluster.run(["-n", spec.namespace, "get", kind, name, "-o", "json"], check=False).strip()
                 if raw:
                     current = json.loads(raw)
@@ -3651,6 +3658,17 @@ def _install_pinned_openshell_wrapper(
             # SWE task images vary by Python minor version and installation
             # prefix. Keep backend access scoped to Python 3 interpreters and
             # the single backend endpoint declared above.
+            # The OpenShell sandbox image resolves `python3` through a
+            # uv-managed venv (/sandbox/.venv/bin/python3 ->
+            # /sandbox/.uv/python/cpython-*/bin/python3.*). The supervisor
+            # matches the resolved executable path, so without these entries
+            # the in-sandbox call is refused with
+            # `transparent_tcp_policy_denied` even when the Kubernetes
+            # NetworkPolicy allows the destination.
+            "      - path: /sandbox/.venv/bin/python3\n"
+            "      - path: /sandbox/.venv/bin/python3.*\n"
+            "      - path: /sandbox/.uv/python/*/bin/python3\n"
+            "      - path: /sandbox/.uv/python/*/bin/python3.*\n"
             "      - path: /usr/sbin/python3\n"
             "      - path: /usr/sbin/python3.*\n"
             "      - path: /usr/bin/python3\n"
@@ -4234,7 +4252,11 @@ def _workload_command(
         recorded_result_bytes is not None
         and (
             workload == "customer_support_ops"
-            or (workload == "research_deep_search" and (name.endswith("__search") or name.endswith("__get_document")))
+            or (workload == "research_deep_search" and (
+                name.endswith("__search")
+                or name.endswith("__get_document")
+                or name.endswith("__submit")
+            ))
         )
     ):
         request["recorded_result_bytes"] = recorded_result_bytes
@@ -4574,7 +4596,11 @@ def prepare_workload_corpus(
             "real OpenShell commands against pinned source checkout; task-image dependencies are not guaranteed"
         ),
         "personal_assistant": "stateful AppWorld API execution",
-        "research_deep_search": "local generated responses with recorded byte lengths where available; no live document service",
+        "research_deep_search": (
+            "BrowseComp-Plus BM25 retrieval over the configured local index; model continuations remain recorded"
+            if backends.get("research_deep_search") and backends["research_deep_search"].research_mode == "browsecompplus" else
+            "local generated responses with recorded byte lengths where available; no live document service"
+        ),
         "customer_support_ops": "local generated responses with recorded byte lengths where available; no live support service",
     }
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -5889,15 +5915,19 @@ def main() -> int:
         parser.error(str(exc))
     if STRICT_OWNERSHIP:
         allowed_node = os.environ.get("TRACE_REPLAY_ALLOWED_NODE", "").strip()
-        if RESOURCE_PREFIX != "aharush" or not allowed_node or target_nodes != (allowed_node,):
-            parser.error("strict ownership requires aharush names and exactly the approved target node")
+        if len(target_nodes) != 1 or (allowed_node and target_nodes != (allowed_node,)):
+            parser.error(
+                "strict ownership requires exactly one target node, matching "
+                "TRACE_REPLAY_ALLOWED_NODE when it is set"
+            )
+        owned_prefix = f"{RESOURCE_PREFIX}-"
         if not OWNED_NAMESPACES or any(
-            not name.startswith("aharush-") and name != EXTERNAL_SANDBOX_NAMESPACE
+            not name.startswith(owned_prefix) and name != EXTERNAL_SANDBOX_NAMESPACE
             for name in OWNED_NAMESPACES
         ):
             parser.error(
-                "strict ownership requires aharush-* namespaces, except for the explicitly configured "
-                "OpenShell sandbox namespace"
+                f"strict ownership requires {owned_prefix}* namespaces, except for the explicitly "
+                "configured OpenShell sandbox namespace"
             )
         if EXTERNAL_SANDBOX_NAMESPACE and args.openshell_namespace != EXTERNAL_SANDBOX_NAMESPACE:
             parser.error(
@@ -5908,8 +5938,8 @@ def main() -> int:
         if args.allow_cross_node:
             parser.error("strict ownership refuses --allow-cross-node")
         for name in (args.workspace_pvc, *workspace_pvcs.values()):
-            if name and not name.startswith("aharush-"):
-                parser.error(f"strict ownership refuses non-aharush PVC name {name}")
+            if name and not name.startswith(owned_prefix):
+                parser.error(f"strict ownership refuses PVC name outside {owned_prefix}*: {name}")
     if len(target_nodes) > 1 and args.allow_cross_node:
         parser.error(
             "--allow-cross-node is incompatible with controlled multi-node placement; "
@@ -6045,7 +6075,9 @@ def main() -> int:
         if STRICT_OWNERSHIP:
             for workload in allocation:
                 spec = backends[workload]
-                if spec.namespace not in OWNED_NAMESPACES or not spec.name.startswith("aharush-") or not spec.service.startswith("aharush-"):
+                if (spec.namespace not in OWNED_NAMESPACES
+                        or not spec.name.startswith(owned_prefix)
+                        or not spec.service.startswith(owned_prefix)):
                     parser.error(f"strict ownership refuses backend {workload}: {spec.namespace}/{spec.name}")
         swe_manifest = (
             load_swe_manifest(args.swe_task_manifest)

@@ -31,9 +31,11 @@ class BackendSpec:
     event_name: str
     real_backend: bool
     deployment_mode: str
+    research_mode: str = "synthetic"
     image: str | None = None
     endpoint: str | None = None
     manifest: str | None = None
+    pvc: str | None = None
     notes: str = ""
 
     @property
@@ -137,6 +139,10 @@ def _validate_override(workload: str, value: dict[str, Any]) -> BackendSpec:
     if not bool(merged["real_backend"]):
         raise BackendConfigurationError(
             f"backend override for {workload} is not marked real_backend=true; refusing to use a replay fixture as a real workload backend"
+        )
+    if workload == "research_deep_search" and merged.get("research_mode") not in {"synthetic", "browsecompplus"}:
+        raise BackendConfigurationError(
+            "research backend research_mode must be 'synthetic' or 'browsecompplus'"
         )
     if merged["deployment_mode"] not in {"existing", "managed"}:
         raise BackendConfigurationError(f"unsupported deployment_mode for {workload}: {merged['deployment_mode']}")

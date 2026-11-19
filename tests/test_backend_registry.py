@@ -73,3 +73,25 @@ def test_manifest_override_must_be_real(tmp_path: Path):
     )
     with pytest.raises(BackendConfigurationError, match="real_backend=true"):
         load_backends(manifest)
+
+
+def test_browsecompplus_real_backend_override_is_explicit_and_owned():
+    root = Path(__file__).parents[1]
+    backends = load_backends(root / "config/backend-manifest.browsecompplus-real.example.json")
+    research = backends["research_deep_search"]
+    assert research.research_mode == "browsecompplus"
+    assert research.name == "browsecompplus-real-backend"
+    assert research.service == "browsecompplus-real-backend"
+    assert research.namespace == "trace-replay"
+    assert research.manifest == "k8s/browsecompplus-real-backend.yaml"
+    assert research.pvc == "browsecompplus-real-index"
+
+
+def test_browsecompplus_rejects_unknown_research_mode(tmp_path: Path):
+    manifest = tmp_path / "backends.json"
+    manifest.write_text(
+        '{"backends":{"research_deep_search":{"research_mode":"neither"}}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(BackendConfigurationError, match="research_mode"):
+        load_backends(manifest)

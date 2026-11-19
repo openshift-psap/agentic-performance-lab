@@ -1,0 +1,44 @@
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: browsecompplus-real-runtime
+  namespace: trace-replay
+  labels:
+    app: browsecompplus-real-backend
+    managed-by: trace-replay-experiment
+spec:
+  lookupPolicy:
+    local: true
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: browsecompplus-real-runtime
+  namespace: trace-replay
+  labels:
+    app: browsecompplus-real-backend
+    managed-by: trace-replay-experiment
+spec:
+  source:
+    type: Binary
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+  output:
+    to:
+      kind: ImageStreamTag
+      name: browsecompplus-real-runtime:latest
+  runPolicy: Serial
+  # Pin the build to a node if your cluster needs it, e.g.:
+  # nodeSelector:
+  #   kubernetes.io/hostname: <node-name>
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+  successfulBuildsHistoryLimit: 3
+  failedBuildsHistoryLimit: 3

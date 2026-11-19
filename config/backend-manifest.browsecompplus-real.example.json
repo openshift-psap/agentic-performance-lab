@@ -1,0 +1,22 @@
+{
+  "backends": {
+    "research_deep_search": {
+      "name": "browsecompplus-real-backend",
+      "benchmark": "browsecompplus",
+      "namespace": "trace-replay",
+      "service": "browsecompplus-real-backend",
+      "port": 8093,
+      "health_path": "/health",
+      "execute_path": "/execute",
+      "events_path": "/events",
+      "event_name": "browsecompplus_tool",
+      "real_backend": true,
+      "deployment_mode": "managed",
+      "research_mode": "browsecompplus",
+      "image": "image-registry.openshift-image-registry.svc:5000/trace-replay/browsecompplus-real-runtime:latest",
+      "manifest": "k8s/browsecompplus-real-backend.yaml",
+      "pvc": "browsecompplus-real-index",
+      "notes": "Direct Pyserini BM25 retrieval from the local BrowseComp-Plus fixed corpus; model continuations remain recorded."
+    }
+  }
+}

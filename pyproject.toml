@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 analyze = ["matplotlib>=3.8", "numpy>=1.26"]
+browsecomp = ["pyserini==1.2.0"]
 
 [project.scripts]
 trace-replay-sim = "trace_replay_sim.cli:main"
@@ -27,4 +28,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = [".", "src"]

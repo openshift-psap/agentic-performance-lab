@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: browsecompplus-real-index
+  namespace: trace-replay
+  labels:
+    app: browsecompplus-real-backend
+    managed-by: trace-replay-experiment
+spec:
+  storageClassName: rook-cephfs-fast
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: browsecompplus-real-backend
+  namespace: trace-replay
+  labels:
+    app: browsecompplus-real-backend
+    managed-by: trace-replay-experiment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: browsecompplus-real-backend
+  template:
+    metadata:
+      labels:
+        app: browsecompplus-real-backend
+        managed-by: trace-replay-experiment
+    spec:
+      # Pin to a node if your cluster needs it, e.g.:
+      # nodeSelector:
+      #   kubernetes.io/hostname: <node-name>
+      initContainers:
+        - name: download-browsecomp-index
+          image: image-registry.openshift-image-registry.svc:5000/trace-replay/browsecompplus-real-runtime:latest
+          imagePullPolicy: IfNotPresent
+          command: ["hf", "download"]
+          args:
+            - Tevatron/browsecomp-plus-indexes
+            - --repo-type
+            - dataset
+            - --revision
+            - b3f37f70c33829eb09d04784a54277a31871fd63
+            - --include
+            - bm25/*
+            - --local-dir
+            - /data/indexes
+          volumeMounts:
+            - name: index
+              mountPath: /data/indexes
+      containers:
+        - name: browsecompplus-real-backend
+          image: image-registry.openshift-image-registry.svc:5000/trace-replay/browsecompplus-real-runtime:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/app/domain_backend.py"]
+          args:
+            - --workload
+            - research_deep_search
+            - --port
+            - "8093"
+            - --research-mode
+            - browsecompplus
+            - --browsecomp-index-path
+            - /data/indexes/bm25
+          ports:
+            - name: http
+              containerPort: 8093
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "2", memory: 8Gi}
+          volumeMounts:
+            - {name: source, mountPath: /app/domain_backend.py, subPath: domain_backend.py, readOnly: true}
+            - {name: sessions, mountPath: /data/sessions}
+            - {name: index, mountPath: /data/indexes, readOnly: true}
+      volumes:
+        - name: source
+          configMap:
+            name: browsecompplus-real-backend-src
+        - name: sessions
+          emptyDir: {}
+        - name: index
+          persistentVolumeClaim:
+            claimName: browsecompplus-real-index
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: browsecompplus-real-backend
+  namespace: trace-replay
+  labels:
+    app: browsecompplus-real-backend
+    managed-by: trace-replay-experiment
+spec:
+  type: ClusterIP
+  selector:
+    app: browsecompplus-real-backend
+  ports:
+    - name: http
+      port: 8093
+      targetPort: http
