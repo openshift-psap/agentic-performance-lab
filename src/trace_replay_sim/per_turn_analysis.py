@@ -1,17 +1,3 @@
-"""Per-turn analysis: answers Q1–Q5 from jaeger_export + Prometheus data.
-
-Q1: Does context assembly cost scale linearly or super-linearly with token count?
-Q2: Sandbox cold vs warm — is cold start amortized across a session?
-Q3: Tool call parallelism — sequential or concurrent within a turn?
-Q4: At what concurrency does queue wait become the bottleneck? (needs C=5/C=10 runs)
-Q5: Per-session memory footprint at 112k-token contexts?
-
-Usage:
-  python3 -m trace_replay_sim.per_turn_analysis \
-    --traces  results/traces \
-    --prom    results/prometheus \
-    --out     results/per_turn_analysis
-"""
 
 from __future__ import annotations
 
