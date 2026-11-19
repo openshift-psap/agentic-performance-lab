@@ -1,11 +1,3 @@
-"""Declarative workload-backend registry for the cluster experiment.
-
-The trace corpus contains four workload profiles, but a corpus label is not a
-backend.  This module makes that distinction explicit: the controller must
-resolve a stateful backend, verify its health, and record its identity before
-it creates any OpenClaw agents.  Missing backends are a hard preflight error;
-the development fixture is never selected implicitly.
-"""
 
 from __future__ import annotations
 
