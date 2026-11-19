@@ -1,8 +1,4 @@
-"""Pure planning helpers for multi-node benchmark runs.
-
-These functions intentionally do not talk to Kubernetes.  Keeping node and
-warm-pool assignment pure makes the controller testable before any cluster
-mutation and prevents accidental dependence on scheduler timing.
+""" helpers for multi-node benchmark runs.
 """
 
 from __future__ import annotations
