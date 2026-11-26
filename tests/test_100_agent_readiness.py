@@ -573,9 +573,11 @@ def test_agent_resource_names_fit_the_label_value_limit():
 
 
 def test_strict_ownership_rejects_existing_cluster_names(monkeypatch):
-    monkeypatch.setattr(experiment, "STRICT_OWNERSHIP", True)
-    monkeypatch.setattr(experiment, "RESOURCE_PREFIX", "aharush")
-    monkeypatch.setattr(experiment, "OWNED_NAMESPACES", {"aharush-agentic-cpu"})
+    from experiment import config
+
+    monkeypatch.setattr(config, "STRICT_OWNERSHIP", True)
+    monkeypatch.setattr(config, "RESOURCE_PREFIX", "aharush")
+    monkeypatch.setattr(config, "OWNED_NAMESPACES", {"aharush-agentic-cpu"})
 
     experiment.assert_owned_target("aharush-agentic-cpu", "aharush-swebench-backend")
     with pytest.raises(RuntimeError, match="strict ownership refused"):
