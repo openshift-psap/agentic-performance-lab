@@ -141,6 +141,7 @@ from trace_replay_sim.workloads import (
     split_corpus,
 )
 from trace_replay_sim.measurement_tables import write_backend_calls
+from trace_replay_sim.mock_plan import MockPlan, mock_plan, mock_topology
 
 LOG = logging.getLogger("run-experiment")
 TRANSIENT_API_MARKERS = (
@@ -2636,7 +2637,8 @@ def _clone_config(
     *,
     pin_sandbox: bool = True,
     shared_workspace_pvc: str | None = None,
-    mock_service: str | None = None,
+    mock: MockPlan | None = None,
+    agent_index: int = 1,
     gateway_endpoint: str | None = None,
 ) -> str:
     config = cluster.json(["-n", cluster.namespace, "get", "configmap", source])
@@ -2676,10 +2678,10 @@ def _clone_config(
     # sandbox timeout for ordinary interactive use; raise it only in this
     # experiment-owned config so a long recorded session is not truncated.
     entry["config"]["timeoutSeconds"] = int(os.environ.get("TRACE_REPLAY_OPEN_SHELL_TIMEOUT_SECONDS", "900"))
-    if mock_service:
+    if mock:
         for provider in raw.get("models", {}).get("providers", {}).values():
             if isinstance(provider, dict) and provider.get("baseUrl"):
-                provider["baseUrl"] = "http://127.0.0.1:8080/v1"
+                provider["baseUrl"] = mock.endpoint(agent_index)
                 # OpenClaw requires a credential for endpoint providers even
                 # when the in-cluster mock does not authenticate requests.
                 # Without this field it fails before contacting the simulator.
@@ -2788,7 +2790,7 @@ def deploy_agents(
     shared_workspace_pvc: str | None = None,
     appworld_endpoint: str | None = None,
     internal_api_endpoints: list[str] | None = None,
-    mock_service: str | None = None,
+    mock: MockPlan | None = None,
     gateway_endpoint: str | None = None,
     openshell_client_secret: str | None = None,
     allow_cross_node: bool = False,
@@ -3023,9 +3025,9 @@ fs.writeFileSync(sshDestination, sshCode);
 
     def install_local_mock_sidecar(deployment_obj: dict[str, Any]) -> bool:
         """Run an isolated replay simulator beside this OpenClaw gateway."""
-        if not mock_service:
+        if not mock or not mock.sidecar:
             return False
-        prefix = mock_service.removesuffix("-mock-llm")
+        prefix = mock.prefix
         source_name = f"{prefix}-mock-src"
         configmaps = cluster.json(["-n", cluster.namespace, "get", "configmaps", "-l", f"run={prefix}"]).get("items", [])
         corpus_names = sorted(str(x.get("metadata", {}).get("name") or "") for x in configmaps if "-corpus-" in str(x.get("metadata", {}).get("name") or ""))
@@ -3213,7 +3215,8 @@ fs.writeFileSync(sshDestination, sshCode);
                 workspace,
                 pin_sandbox=not allow_cross_node,
                 shared_workspace_pvc=target_workspace_pvc,
-                mock_service=mock_service,
+                mock=mock,
+                agent_index=index,
                 gateway_endpoint=gateway_endpoint,
             )
             deployment_changed = pin_existing_deployment(
@@ -3293,7 +3296,8 @@ fs.writeFileSync(sshDestination, sshCode);
                 workspace,
                 pin_sandbox=not allow_cross_node,
                 shared_workspace_pvc=target_workspace_pvc,
-                mock_service=mock_service,
+                mock=mock,
+                agent_index=index,
                 gateway_endpoint=gateway_endpoint,
             )
             pin_existing_deployment(
@@ -3353,7 +3357,8 @@ fs.writeFileSync(sshDestination, sshCode);
             workspace,
             pin_sandbox=not allow_cross_node,
             shared_workspace_pvc=target_workspace_pvc,
-            mock_service=mock_service,
+            mock=mock,
+            agent_index=index,
             gateway_endpoint=gateway_endpoint,
         )
         deployment = cluster.json(["-n", cluster.namespace, "get", "deployment", name if existing else BASE_OPENCLAW])
@@ -3423,7 +3428,7 @@ fs.writeFileSync(sshDestination, sshCode);
 def verify_agent_mock_endpoints(
     cluster: Cluster,
     agent_bindings: list[tuple[str, str, str]],
-    mock_service: str,
+    mock: MockPlan,
     agent_indices: list[int] | tuple[int, ...] | None = None,
 ) -> None:
     """Prove that each selected running gateway loaded this run's mock URL.
@@ -3433,10 +3438,10 @@ def verify_agent_mock_endpoints(
     config.  Read the live file from the gateway so trace dispatch cannot begin
     with a stale data-plane endpoint.
     """
-    expected = "http://127.0.0.1:8080/v1"
     indices = list(agent_indices or range(1, len(agent_bindings) + 1))
 
     def verify(index: int) -> None:
+        expected = mock.endpoint(index)
         try:
             agent = agent_bindings[index - 1][0]
         except IndexError as exc:
@@ -4049,15 +4054,21 @@ def ensure_driver_config(cluster: Cluster) -> None:
     })
 
 
-def ensure_mock_llm_config(cluster: Cluster, replay_corpus: Path, system_ns: str, run_token: str) -> str:
-    """Create a run-owned mock service without touching the shared baseline."""
+def ensure_mock_llm_config(
+    cluster: Cluster,
+    replay_corpus: Path,
+    system_ns: str,
+    run_token: str,
+    agents: int,
+    topology: str,
+) -> MockPlan:
+    """Create the run-owned mock corpus and the mocks for one topology."""
     # Keep the run hash in the resource name.  Truncating only the beginning
     # caused different runs with the same long output prefix to overwrite one
     # another's mock corpus and Deployment.
     token = safe_name(run_token).strip("-")
     token = f"{token[:14].rstrip('-')}-{token[-8:]}" if len(token) > 8 else token
     prefix = f"{RESOURCE_PREFIX}-{token}"
-    service_name = f"{prefix}-mock-llm"
     source_name = f"{prefix}-mock-src"
     replay_payload = json.loads(replay_corpus.read_text(encoding="utf-8"))
     sessions = replay_payload.get("sessions") or []
@@ -4096,57 +4107,60 @@ def ensure_mock_llm_config(cluster: Cluster, replay_corpus: Path, system_ns: str
         mount_path = f"/data/corpus/part-{index:03d}"
         corpus_volumes.append({"name": volume_name, "configMap": {"name": part_name}})
         corpus_mounts.append({"name": volume_name, "mountPath": mount_path, "readOnly": True})
-    base = cluster.json(["-n", system_ns, "get", "deployment", BASE_MOCK_LLM])
-    for key in ("uid", "resourceVersion", "generation", "creationTimestamp", "managedFields", "status"):
-        base.get("metadata", {}).pop(key, None)
-    base["metadata"]["name"] = service_name
-    base["metadata"]["labels"] = {"app": service_name, "managed-by": "trace-replay-experiment", "run": prefix}
-    spec = base["spec"]
-    spec["replicas"] = 1
-    spec["selector"]["matchLabels"] = {"app": service_name}
-    template = spec["template"]
-    template["metadata"]["labels"] = {"app": service_name, "managed-by": "trace-replay-experiment", "run": prefix}
-    # The mock process loads its corpus once at startup.  A resumed invocation
-    # can keep the same run-scoped Service name while changing the selected
-    # sessions, so make the corpus revision part of the pod template.  This
-    # forces a bounded rollout instead of silently serving the previous
-    # in-memory corpus through an apparently healthy Service.
-    template["metadata"].setdefault("annotations", {})[
-        "trace-replay.openai.com/mock-corpus-sha256"
-    ] = corpus_revision
-    template["spec"]["nodeSelector"] = {"kubernetes.io/hostname": cluster.node}
-    for container in template["spec"].get("containers", []):
-        if container.get("name") != "mock-llm":
-            continue
-        env = {item["name"]: item.get("value", "") for item in container.get("env", []) if item.get("name")}
-        env.update({
-            "REPLAY_CORPUS": "/data/corpus",
-            "MOCK_EDGES_PATH": "/edges/mock_edges.jsonl",
-            "OTLP_ENDPOINT": f"http://{BASE_JAEGER}.{system_ns}.svc.cluster.local:4318",
+    plan = mock_plan(topology, system_ns, prefix, agents)
+    for service_name in plan.services:
+        base = cluster.json(["-n", system_ns, "get", "deployment", BASE_MOCK_LLM])
+        for key in ("uid", "resourceVersion", "generation", "creationTimestamp", "managedFields", "status"):
+            base.get("metadata", {}).pop(key, None)
+        base["metadata"]["name"] = service_name
+        base["metadata"]["labels"] = {"app": service_name, "managed-by": "trace-replay-experiment", "run": prefix}
+        spec = base["spec"]
+        spec["replicas"] = 1
+        spec["selector"]["matchLabels"] = {"app": service_name}
+        template = spec["template"]
+        template["metadata"]["labels"] = {"app": service_name, "managed-by": "trace-replay-experiment", "run": prefix}
+        # The mock process loads its corpus once at startup.  A resumed invocation
+        # can keep the same run-scoped Service name while changing the selected
+        # sessions, so make the corpus revision part of the pod template.  This
+        # forces a bounded rollout instead of silently serving the previous
+        # in-memory corpus through an apparently healthy Service.
+        template["metadata"].setdefault("annotations", {})[
+            "trace-replay.openai.com/mock-corpus-sha256"
+        ] = corpus_revision
+        template["spec"]["nodeSelector"] = {"kubernetes.io/hostname": cluster.node}
+        for container in template["spec"].get("containers", []):
+            if container.get("name") != "mock-llm":
+                continue
+            env = {item["name"]: item.get("value", "") for item in container.get("env", []) if item.get("name")}
+            env.update({
+                "REPLAY_CORPUS": "/data/corpus",
+                "MOCK_EDGES_PATH": "/edges/mock_edges.jsonl",
+                "OTLP_ENDPOINT": f"http://{BASE_JAEGER}.{system_ns}.svc.cluster.local:4318",
+            })
+            container["env"] = [{"name": name, "value": value} for name, value in env.items()]
+            mounts = [mount for mount in container.get("volumeMounts", []) if mount.get("name") not in {"src", "corpus", "edges"}]
+            mounts.extend([
+                {"name": "src", "mountPath": "/app", "readOnly": True},
+                *corpus_mounts,
+                {"name": "edges", "mountPath": "/edges"},
+            ])
+            container["volumeMounts"] = mounts
+        template["spec"]["volumes"] = [
+            {"name": "src", "configMap": {"name": source_name}},
+            *corpus_volumes,
+            {"name": "edges", "emptyDir": {}},
+        ]
+        cluster.apply_json_in_with_retry(system_ns, base)
+        cluster.apply_json_in_with_retry(system_ns, {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": service_name, "labels": {"app": service_name, "managed-by": "trace-replay-experiment", "run": prefix}},
+            "spec": {"selector": {"app": service_name}, "ports": [{"name": "http", "port": 8080, "targetPort": 8080}]},
         })
-        container["env"] = [{"name": name, "value": value} for name, value in env.items()]
-        mounts = [mount for mount in container.get("volumeMounts", []) if mount.get("name") not in {"src", "corpus", "edges"}]
-        mounts.extend([
-            {"name": "src", "mountPath": "/app", "readOnly": True},
-            *corpus_mounts,
-            {"name": "edges", "mountPath": "/edges"},
-        ])
-        container["volumeMounts"] = mounts
-    template["spec"]["volumes"] = [
-        {"name": "src", "configMap": {"name": source_name}},
-        *corpus_volumes,
-        {"name": "edges", "emptyDir": {}},
-    ]
-    cluster.apply_json_in_with_retry(system_ns, base)
-    cluster.apply_json_in_with_retry(system_ns, {
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {"name": service_name, "labels": {"app": service_name, "managed-by": "trace-replay-experiment", "run": prefix}},
-        "spec": {"selector": {"app": service_name}, "ports": [{"name": "http", "port": 8080, "targetPort": 8080}]},
-    })
-    cluster.wait_rollout_in(system_ns, service_name)
-    log_phase(f"deployment: owned mock LLM ready ({service_name}, {len(corpus_parts)} corpus parts)")
-    return service_name
+        cluster.wait_rollout_in(system_ns, service_name)
+    mocks = ", ".join(plan.services) if plan.services else "in-pod sidecars"
+    log_phase(f"deployment: mock LLM ready ({mocks}, {len(corpus_parts)} corpus parts)")
+    return plan
 
 
 def _appworld_command(session_id: str, turn: int, call: int, name: str, arguments: dict[str, Any], endpoint: str) -> list[str]:
@@ -5075,7 +5089,7 @@ def collect_trace(
     workspace: str,
     openshell_ns: str,
     backend: Any,
-    mock_service: str,
+    mock_deployment: str,
     *,
     allow_cross_node: bool = False,
     prewarm_requested: bool = True,
@@ -5467,7 +5481,7 @@ def collect_trace(
     # produced the reference waterfall.
     def read_mock_edges() -> str:
         return cluster.run(
-            ["-n", cluster.namespace, "exec", f"deployment/{agent}", "-c", "mock-llm", "--", "cat", "/edges/mock_edges.jsonl"],
+            ["-n", cluster.namespace, "exec", f"deployment/{mock_deployment}", "-c", "mock-llm", "--", "cat", "/edges/mock_edges.jsonl"],
             check=False,
         )
 
@@ -6485,7 +6499,14 @@ def main() -> int:
         appworld_tool_endpoint = sandbox_backend_endpoints["personal_assistant"] + "/execute"
     node_groups = write_deployment_plan(agent_nodes)
     run_token = run_stem
-    mock_service = ensure_mock_llm_config(cluster, runtime_corpus, args.system_namespace, run_token)
+    mock = ensure_mock_llm_config(
+        cluster,
+        runtime_corpus,
+        args.system_namespace,
+        run_token,
+        args.agents,
+        mock_topology(),
+    )
     ensure_driver_config(cluster)
     agent_client_secret = _ensure_openshell_client_secret(
         cluster,
@@ -6579,7 +6600,7 @@ def main() -> int:
             shared_workspace_pvcs=shared_workspace_pvcs,
             appworld_endpoint=appworld_tool_endpoint,
             internal_api_endpoints=sandbox_internal_api_endpoints,
-            mock_service=mock_service,
+            mock=mock,
             gateway_endpoint=args.openshell_gateway_endpoint,
             openshell_client_secret=agent_client_secret,
             allow_cross_node=args.allow_cross_node,
@@ -6604,7 +6625,7 @@ def main() -> int:
                 shared_workspace_pvcs=shared_workspace_pvcs,
                 appworld_endpoint=appworld_tool_endpoint,
                 internal_api_endpoints=sandbox_internal_api_endpoints,
-                mock_service=mock_service,
+                mock=mock,
                 gateway_endpoint=args.openshell_gateway_endpoint,
                 openshell_client_secret=agent_client_secret,
                 allow_cross_node=args.allow_cross_node,
@@ -6626,7 +6647,7 @@ def main() -> int:
                 shared_workspace_pvcs=shared_workspace_pvcs,
                 appworld_endpoint=appworld_tool_endpoint,
                 internal_api_endpoints=sandbox_internal_api_endpoints,
-                mock_service=mock_service,
+                mock=mock,
                 gateway_endpoint=args.openshell_gateway_endpoint,
                 openshell_client_secret=agent_client_secret,
                 allow_cross_node=args.allow_cross_node,
@@ -6674,7 +6695,7 @@ def main() -> int:
                 shared_workspace_pvcs=shared_workspace_pvcs,
                 appworld_endpoint=appworld_tool_endpoint,
                 internal_api_endpoints=sandbox_internal_api_endpoints,
-                mock_service=mock_service,
+                mock=mock,
                 gateway_endpoint=args.openshell_gateway_endpoint,
                 openshell_client_secret=agent_client_secret,
                 allow_cross_node=args.allow_cross_node,
@@ -6706,7 +6727,7 @@ def main() -> int:
     verify_agent_mock_endpoints(
         cluster,
         agent_bindings,
-        mock_service,
+        mock,
         selected_agent_indices or None,
     )
     # OpenShell workspace creation initializes the per-workspace subpaths and
@@ -6940,7 +6961,7 @@ def main() -> int:
                             workspace,
                             args.openshell_namespace,
                             backends[item["workload"]],
-                            mock_service,
+                            mock.recorder(binding_index + 1, agent),
                             allow_cross_node=args.allow_cross_node,
                             prewarm_requested=prewarm_requested,
                             warm_pool_slot=warm_pool_slot,
@@ -6969,7 +6990,7 @@ def main() -> int:
                             workspace,
                             args.openshell_namespace,
                             backends[item["workload"]],
-                            mock_service,
+                            mock.recorder(binding_index + 1, agent),
                             allow_cross_node=args.allow_cross_node,
                             prewarm_requested=prewarm_requested,
                             warm_pool_slot=warm_pool_slot,
