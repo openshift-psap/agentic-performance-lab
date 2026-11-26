@@ -421,6 +421,44 @@ def test_workspace_pvc_pins_an_explicit_storage_class():
     assert _workspace_pvc("cephfs-fast")["storageClassName"] == "cephfs-fast"
 
 
+def _shared_workspace(name_count, **kwargs):
+    cluster = _FakeWorkspaceCluster()
+    ensure_shared_workspace(
+        cluster,
+        "openshell-tracesim",
+        "trace-replay-workspace",
+        "",
+        [f"agent-{index}" for index in range(1, name_count + 1)],
+        "ReadWriteMany",
+        target_node="node-a",
+        **kwargs,
+    )
+    return cluster
+
+
+def test_shared_workspace_refuses_several_workspaces_per_claim_by_default():
+    with pytest.raises(ValueError, match="allow-shared-workspace-pvc"):
+        _shared_workspace(2)
+
+
+def test_shared_workspace_allows_several_workspaces_per_claim_when_asked():
+    cluster = _shared_workspace(2, allow_shared=True)
+    pvc = next(item for item in cluster.applied if item["kind"] == "PersistentVolumeClaim")
+    job = next(item for item in cluster.applied if item["kind"] == "Job")
+    assert pvc["metadata"]["labels"] == {
+        "managed-by": "trace-replay-experiment",
+        "component": "openshell-shared-workspace",
+        "openshell.ai/sandbox-attachable": "true",
+    }
+    assert "'agent-1','agent-2'" in job["spec"]["template"]["spec"]["containers"][0]["args"][0]
+
+
+def test_shared_workspace_labels_a_single_workspace_claim():
+    cluster = _shared_workspace(1)
+    pvc = next(item for item in cluster.applied if item["kind"] == "PersistentVolumeClaim")
+    assert pvc["metadata"]["labels"]["openshell.ai/sandbox-attachable-workspace"] == "agent-1"
+
+
 class _RecordingTraceCluster:
     node = "node-a"
     namespace = "trace-replay"

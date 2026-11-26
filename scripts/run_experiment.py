@@ -675,6 +675,7 @@ def ensure_shared_workspace(
     access_mode: str,
     *,
     target_node: str | None = None,
+    allow_shared: bool = False,
 ) -> None:
     """Provision one experiment-owned shared workspace and its agent subpaths.
 
@@ -687,18 +688,19 @@ def ensure_shared_workspace(
     """
     if not workspace_names:
         raise ValueError("workspace_names must not be empty")
-    if len(workspace_names) != 1:
+    if len(workspace_names) != 1 and not allow_shared:
         raise ValueError(
             "the OpenShell Kubernetes driver requires an approval label per workspace; "
-            "a shared PVC can currently serve only one workspace under the default admission policy"
+            "pass --allow-shared-workspace-pvc to place several agent workspaces on one claim"
         )
     if access_mode not in {"ReadWriteMany", "ReadWriteOnce"}:
         raise ValueError(f"unsupported workspace access mode: {access_mode}")
     node = target_node or cluster.node
-    attachment_labels = {
-        "openshell.ai/sandbox-attachable": "true",
-        "openshell.ai/sandbox-attachable-workspace": workspace_names[0],
-    }
+    attachment_labels = {"openshell.ai/sandbox-attachable": "true"}
+    if len(workspace_names) == 1:
+        # The workspace-scoped approval label matches one workspace only; with
+        # several subpaths on one claim the gateway must not enforce it.
+        attachment_labels["openshell.ai/sandbox-attachable-workspace"] = workspace_names[0]
     existing = cluster.run(["-n", openshell_ns, "get", "pvc", pvc_name], check=False).strip()
     if existing:
         pvc = json.loads(cluster.run(["-n", openshell_ns, "get", "pvc", pvc_name, "-o", "json"]))
@@ -5827,6 +5829,12 @@ def main() -> int:
         help="StorageClass for workspace PVCs; empty uses the cluster default",
     )
     parser.add_argument("--workspace-access-mode", choices=("ReadWriteMany", "ReadWriteOnce"), default=os.environ.get("TRACE_REPLAY_WORKSPACE_ACCESS_MODE", "ReadWriteMany"))
+    parser.add_argument(
+        "--allow-shared-workspace-pvc",
+        action="store_true",
+        default=os.environ.get("TRACE_REPLAY_ALLOW_SHARED_WORKSPACE_PVC") == "1",
+        help="place several agent workspaces on one PVC (requires the gateway admission gate to be off)",
+    )
     parser.add_argument("--kubeconfig", default=os.environ.get("KUBECONFIG"))
     parser.add_argument("--jaeger", default="http://127.0.0.1:16686")
     parser.add_argument("--reuse-agents", action="store_true")
@@ -6543,6 +6551,7 @@ def main() -> int:
             workspace_names,
             args.workspace_access_mode,
             target_node=target_nodes[0],
+            allow_shared=args.allow_shared_workspace_pvc,
         )
         shared_workspace_pvcs = {node: shared_workspace_pvc for node in target_nodes}
     else:
@@ -6588,6 +6597,7 @@ def main() -> int:
                     node_workspaces,
                     args.workspace_access_mode,
                     target_node=node,
+                    allow_shared=args.allow_shared_workspace_pvc,
                 )
                 shared_workspace_pvcs[node] = pvc_name
     if not args.resume_existing_run:
